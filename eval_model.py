@@ -458,7 +458,7 @@ def SaveEstimators(path, estimators, return_df=False):
             'true_card': est.true_cards,
             'query_dur_ms': est.query_dur_ms,
         }
-        results = results.append(pd.DataFrame(data))
+        results = pd.concat([results, pd.DataFrame(data)], ignore_index=True)
     if return_df:
         return results
     results.to_csv(path, index=False)
