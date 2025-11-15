@@ -1,3 +1,6 @@
 __pycache__
 .DS_Store
-naruto_env/
+naru_env/
+*.pt
+*.pth
+*.ckpt

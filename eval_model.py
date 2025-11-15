@@ -150,11 +150,15 @@ def InvertOrder(order):
 
 
 def MakeTable():
-    assert args.dataset in ['dmv-tiny', 'dmv']
+    # To extend to other datasets, modify here.
+    # Add dataset loading in datasets.py as well.
+    assert args.dataset in ['dmv-tiny', 'dmv', 'tpch']
     if args.dataset == 'dmv-tiny':
         table = datasets.LoadDmv('dmv-tiny.csv')
     elif args.dataset == 'dmv':
         table = datasets.LoadDmv()
+    elif args.dataset == 'tpch':
+        table = datasets.LoadTpch('tpch_lineitem_10k.csv')
 
     oracle_est = estimators_lib.Oracle(table)
     if args.run_bn:
@@ -184,6 +188,18 @@ def SampleTupleThenRandom(all_cols,
         # Giant hack for DMV.
         vals[6] = vals[6].to_datetime64()
 
+    elif args.dataset == 'tpch':
+        # Indices 10, 11, 12 correspond to L_SHIPDATE, L_COMMITDATE, L_RECEIPTDATE
+        # in the LoadTpch column definition. We must convert them to datetime64
+        # for correct comparison operations (<=, >=).
+        target_date_cols = ['L_SHIPDATE', 'L_COMMITDATE', 'L_RECEIPTDATE']
+        # Iterate through all columns to find date columns
+        for i, col in enumerate(all_cols):
+            if col.name in target_date_cols:
+                # Check if already np.datetime64 to avoid errors
+                if not isinstance(vals[i], np.datetime64):
+                     vals[i] = vals[i].to_datetime64()
+
     idxs = rng.choice(len(all_cols), replace=False, size=num_filters)
     cols = np.take(all_cols, idxs)
 
@@ -208,7 +224,20 @@ def SampleTupleThenRandom(all_cols,
 
 def GenerateQuery(all_cols, rng, table, return_col_idx=False):
     """Generate a random query."""
-    num_filters = rng.randint(5, 12)
+    num_avail_cols = len(all_cols)
+    # Max cols = 11 to avoid very large queries.
+    # If the number of columns is smaller, adjust accordingly.
+    max_filters = min(11, num_avail_cols)
+
+    # Min cols = 3 or num_avail_cols, whichever is smaller.
+    min_filters = min(3,num_avail_cols)
+
+    if min_filters >= max_filters:
+        num_filters = max_filters
+    else:
+        # Set randint range to be inclusive of max_filters
+        num_filters = rng.randint(min_filters, max_filters + 1) 
+
     cols, ops, vals = SampleTupleThenRandom(all_cols,
                                             num_filters,
                                             rng,
@@ -516,7 +545,8 @@ def Main():
                                     fixed_ordering=order,
                                     seed=seed)
         else:
-            if args.dataset in ['dmv-tiny', 'dmv']:
+            # Add further datasets here as needed.
+            if args.dataset in ['dmv-tiny', 'dmv', 'tpch']:
                 model = MakeMade(
                     scale=args.fc_hiddens,
                     cols_to_train=table.columns,
