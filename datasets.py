@@ -25,7 +25,7 @@ def LoadTpch(filename='tpch_lineitem_10k.csv'):
     csv_file = './datasets/{}'.format(filename)
 
     cols = [
-        # Key columns slow down NARU extremelyly, so we skip them here.
+        # Key columns slow down NARU extremely, so we skip them here.
         # 'L_ORDERKEY', 'L_PARTKEY', 'L_SUPPKEY',
         #'L_LINENUMBER',
         #'L_QUANTITY', 
@@ -39,7 +39,7 @@ def LoadTpch(filename='tpch_lineitem_10k.csv'):
         'L_RECEIPTDATE', 
         'L_SHIPINSTRUCT', 
         'L_SHIPMODE',
-        # Comment column will never be indexed or filtered, so we can skip it.
+        # Comment column is unlikely to be indexed or filtered, so we can skip it.
         # 'L_COMMENT'
     ]
 

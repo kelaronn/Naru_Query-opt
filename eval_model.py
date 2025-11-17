@@ -16,6 +16,7 @@ import datasets
 import estimators as estimators_lib
 import made
 import transformer
+import pickle
 
 # For inference speed.
 torch.backends.cudnn.deterministic = False
@@ -158,7 +159,18 @@ def MakeTable():
     elif args.dataset == 'dmv':
         table = datasets.LoadDmv()
     elif args.dataset == 'tpch':
-        table = datasets.LoadTpch('tpch_lineitem_10k.csv')
+        test_filename = '{}_test_split.csv'.format(args.dataset)
+        print(f'Loading strictly test data ({test_filename})... ')
+        test_df = pd.read_csv(os.path.join('./datasets', test_filename))
+        try:
+            with open('./datasets/tpch_train_table.pkl', 'rb') as f:
+                table = pickle.load(f)
+        except FileNotFoundError:
+            print("ERROR: tpch_train_table.pkl not found!")
+            print("Please run train_model.py first to generate the bins.")
+            raise
+        table.data = test_df    
+        table.cardinality = len(test_df)
 
     oracle_est = estimators_lib.Oracle(table)
     if args.run_bn:
@@ -198,7 +210,7 @@ def SampleTupleThenRandom(all_cols,
             if col.name in target_date_cols:
                 # Check if already np.datetime64 to avoid errors
                 if not isinstance(vals[i], np.datetime64):
-                     vals[i] = vals[i].to_datetime64()
+                     vals[i] = np.datetime64(vals[i])
 
     idxs = rng.choice(len(all_cols), replace=False, size=num_filters)
     cols = np.take(all_cols, idxs)

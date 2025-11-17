@@ -4,7 +4,6 @@ class Naru:
         self.model.eval()
 
     def selectivity(self, predicate_list):
-        # SQL predikátum → NARU input tensor → logprob
         prob = self.model.estimate_selectivity(predicate_list)
         return float(prob)
 
