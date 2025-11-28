@@ -179,7 +179,6 @@ def RunEpoch(split,
         if split == 'test' and nsamples > 1:
             # At test, we want to test the 'true' nll under all orderings.
             num_orders_to_forward = nsamples
-
         for i in range(num_orders_to_forward):
             if hasattr(model, 'update_masks'):
                 # We want to update_masks even for first ever batch.
@@ -283,7 +282,8 @@ def MakeMade(scale, cols_to_train, seed, fixed_ordering=None):
     if args.inv_order:
         print('Inverting order!')
         fixed_ordering = InvertOrder(fixed_ordering)
-
+    print('cols to train:', cols_to_train)
+    print('len cols to train:', len(cols_to_train))
     model = made.MADE(
         nin=len(cols_to_train),
         hidden_sizes=[scale] *
@@ -340,43 +340,9 @@ def TrainTask(seed=0):
     elif args.dataset == 'tpch':
         table = datasets.LoadTpch('tpch_lineitem_10k.csv')
 
-    
-    # Split logic for early stopping and validation:
-    print("Splitting data into (train/val/test) = (80/10/10) using Pandas...")
-
-    full_df = table.data
-    shuffled_df = full_df.sample(frac=1, random_state=seed)
-
-    n= len(shuffled_df)
-    train_end_index = int(0.8 * n)
-    val_end_index = int(0.9 * n)
-
-    train_df = shuffled_df.iloc[:train_end_index]
-    val_df = shuffled_df.iloc[train_end_index:val_end_index]
-    test_df = shuffled_df.iloc[val_end_index:]
-
-    test_set_path = './datasets/{}_test_split.csv'.format(args.dataset)
-    test_df.to_csv(test_set_path, index=False)
-    print(f"Test set saved to {test_set_path}")
-
-    table_train = copy.deepcopy(table)
-    table_train.data = train_df
-    table_train.cardinality = len(table_train.data)
-
-    table_val = copy.deepcopy(table)
-    table_val.data = val_df
-    table_val.cardinality = len(table_val.data)
-
-    print(f"Data split: {len(table_train.data)} train, {len(table_val.data)} validation, {len(test_df)} test.")
-
-    with open('./datasets/tpch_train_table.pkl', 'wb') as f:
-        import pickle
-        pickle.dump(table_train, f)
-    print("Saved training table definitions (bins) to tpch_train_table.pkl")
-
     table_bits = Entropy(
-        table_train,
-        table_train.data.fillna(value=0).groupby([c.name for c in table_train.columns
+        table,
+        table.data.fillna(value=0).groupby([c.name for c in table.columns
                                            ]).size(), [2])[0]
     fixed_ordering = None
 
@@ -384,27 +350,26 @@ def TrainTask(seed=0):
         print('Using passed-in order:', args.order)
         fixed_ordering = args.order
 
-    # print(table.data.info())
+    print(table.data.info())
 
-    # table_train = table
+    table_train = table
 
     if args.heads > 0:
-        model = MakeTransformer(cols_to_train=table_train.columns,
+        model = MakeTransformer(cols_to_train=table.columns,
                                 fixed_ordering=fixed_ordering,
                                 seed=seed)
     else:
-        # Add further datasets here as needed.
         if args.dataset in ['dmv-tiny', 'dmv', 'tpch']:
             model = MakeMade(
                 scale=args.fc_hiddens,
-                cols_to_train=table_train.columns,
+                cols_to_train=table.columns,
                 seed=seed,
                 fixed_ordering=fixed_ordering,
             )
         else:
             assert False, args.dataset
 
-    mb = ReportModel(model)  
+    mb = ReportModel(model)
 
     if not isinstance(model, transformer.Transformer):
         print('Applying InitWeight()')
@@ -424,116 +389,65 @@ def TrainTask(seed=0):
     log_every = 200
 
     train_data = common.TableDataset(table_train)
-    val_data = common.TableDataset(table_val)
-    patience = 5
-    patience_counter = 0
-    best_val_loss = float('inf')
-    best_model_path = ""
 
     train_losses = []
     train_start = time.time()
     for epoch in range(args.epochs):
 
-        model.train()
         mean_epoch_train_loss = RunEpoch('train',
                                          model,
                                          opt,
                                          train_data=train_data,
-                                         val_data=val_data,
+                                         val_data=train_data,
                                          batch_size=bs,
                                          epoch_num=epoch,
                                          log_every=log_every,
                                          table_bits=table_bits)
 
-        # if epoch % 1 == 0:
-        #     print('epoch {} train loss {:.4f} nats / {:.4f} bits'.format(
-        #         epoch, mean_epoch_train_loss,
-        #         mean_epoch_train_loss / np.log(2)))
-        #     since_start = time.time() - train_start
-        #     print('time since start: {:.1f} secs'.format(since_start))
+        if epoch % 1 == 0:
+            print('epoch {} train loss {:.4f} nats / {:.4f} bits'.format(
+                epoch, mean_epoch_train_loss,
+                mean_epoch_train_loss / np.log(2)))
+            since_start = time.time() - train_start
+            print('time since start: {:.1f} secs'.format(since_start))
 
         train_losses.append(mean_epoch_train_loss)
 
-        model.eval()
-        mean_epoch_val_loss = RunEpoch('val',
-                                 model,
-                                 opt,
-                                 train_data=train_data,
-                                 val_data=val_data,
-                                 batch_size=bs,
-                                 epoch_num=epoch,
-                                 log_every=log_every,
-                                 table_bits=table_bits)
-        
-        print(f'Epoch {epoch}: Train Loss: {mean_epoch_train_loss:.4f} nats, Validation Loss: {mean_epoch_val_loss:.4f} nats')
+    print('Training done; evaluating likelihood on full data:')
+    all_losses = RunEpoch('test',
+                          model,
+                          train_data=train_data,
+                          val_data=train_data,
+                          opt=None,
+                          batch_size=1024,
+                          log_every=500,
+                          table_bits=table_bits,
+                          return_losses=True)
+    model_nats = np.mean(all_losses)
+    model_bits = model_nats / np.log(2)
+    model.model_bits = model_bits
 
-        if mean_epoch_val_loss < best_val_loss:
-            best_val_loss = mean_epoch_val_loss
-            patience_counter = 0
-            
-            if os.path.exists(best_model_path):
-                os.remove(best_model_path)
-
-            model_bits = mean_epoch_val_loss / np.log(2)
-
-            best_model_path = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}.pt'.format(
-                args.dataset, 
-                mb, 
-                model_bits, 
-                table_bits, 
-                model.name(), 
-                epoch,
-                seed
-            )
-            # ------------------------------------
-
-            torch.save(model.state_dict(), best_model_path)
-            print(f'  -> New best model saved (Val Loss: {best_val_loss:.4f} nats)')
-            print(f'     Path: {best_model_path}')
-
+    if fixed_ordering is None:
+        if seed is not None:
+            PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}.pt'.format(
+                args.dataset, mb, model.model_bits, table_bits, model.name(),
+                args.epochs, seed)
         else:
-            patience_counter += 1
-            print(f'  -> No improvement, patience {patience_counter}/{patience}')
+            PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}-{}.pt'.format(
+                args.dataset, mb, model.model_bits, table_bits, model.name(),
+                args.epochs, seed, time.time())
+    else:
+        annot = ''
+        if args.inv_order:
+            annot = '-invOrder'
 
-        if patience_counter >= patience:
-            print(f'Patience exhausted. Stopping training at epoch {epoch}.')
-            break
-
-    # print('Training done; evaluating likelihood on full data:')
-    # all_losses = RunEpoch('test',
-    #                       model,
-    #                       train_data=train_data,
-    #                       val_data=train_data,
-    #                       opt=None,
-    #                       batch_size=1024,
-    #                       log_every=500,
-    #                       table_bits=table_bits,
-    #                       return_losses=True)
-    # model_nats = np.mean(all_losses)
-    # model_bits = model_nats / np.log(2)
-    # model.model_bits = model_bits
-
-    # if fixed_ordering is None:
-    #     if seed is not None:
-    #         PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}.pt'.format(
-    #             args.dataset, mb, model.model_bits, table_bits, model.name(),
-    #             args.epochs, seed)
-    #     else:
-    #         PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}-{}.pt'.format(
-    #             args.dataset, mb, model.model_bits, table_bits, model.name(),
-    #             args.epochs, seed, time.time())
-    # else:
-    #     annot = ''
-    #     if args.inv_order:
-    #         annot = '-invOrder'
-
-    #     PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}-order{}{}.pt'.format(
-    #         args.dataset, mb, model.model_bits, table_bits, model.name(),
-    #         args.epochs, seed, '_'.join(map(str, fixed_ordering)), annot)
-    # os.makedirs(os.path.dirname(PATH), exist_ok=True)
-    # torch.save(model.state_dict(), PATH)
-    # print('Saved to:')
-    # print(PATH)
+        PATH = 'models/{}-{:.1f}MB-model{:.3f}-data{:.3f}-{}-{}epochs-seed{}-order{}{}.pt'.format(
+            args.dataset, mb, model.model_bits, table_bits, model.name(),
+            args.epochs, seed, '_'.join(map(str, fixed_ordering)), annot)
+    os.makedirs(os.path.dirname(PATH), exist_ok=True)
+    torch.save(model.state_dict(), PATH)
+    print('Saved to:')
+    print(PATH)
 
 
 TrainTask()

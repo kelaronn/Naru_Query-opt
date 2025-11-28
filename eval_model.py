@@ -25,116 +25,162 @@ torch.backends.cudnn.benchmark = True
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Device', DEVICE)
 
-parser = argparse.ArgumentParser()
+# Default args object for when eval_model is imported (not run as main)
+class DefaultArgs:
+    dataset = 'tpch'
+    fc_hiddens = 128
+    layers = 4
+    residual = True
+    direct_io = False
+    input_encoding = 'binary'
+    output_encoding = 'one_hot'
+    column_masking = False
+    inv_order = False
+    inference_opts = False
+    num_queries = 20
+    err_csv = 'results.csv'
+    glob = None
+    blacklist = None
+    psample = 2000
+    order = None
+    heads = 0
+    blocks = 2
+    dmodel = 32
+    dff = 128
+    transformer_act = 'gelu'
+    run_sampling = False
+    run_maxdiff = False
+    run_bn = False
+    bn_samples = 200
+    bn_root = 0
+    maxdiff_limit = 30000
 
-parser.add_argument('--inference-opts',
-                    action='store_true',
-                    help='Tracing optimization for better latency.')
+args = DefaultArgs()
 
-parser.add_argument('--num-queries', type=int, default=20, help='# queries.')
-parser.add_argument('--dataset', type=str, default='dmv-tiny', help='Dataset.')
-parser.add_argument('--err-csv',
-                    type=str,
-                    default='results.csv',
-                    help='Save result csv to what path?')
-parser.add_argument('--glob',
-                    type=str,
-                    help='Checkpoints to glob under models/.')
-parser.add_argument('--blacklist',
-                    type=str,
-                    help='Remove some globbed checkpoint files.')
-parser.add_argument('--psample',
-                    type=int,
-                    default=2000,
-                    help='# of progressive samples to use per query.')
-parser.add_argument(
-    '--column-masking',
-    action='store_true',
-    help='Turn on wildcard skipping.  Requires checkpoints be trained with '\
-    'column masking.')
-parser.add_argument('--order',
-                    nargs='+',
-                    type=int,
-                    help='Use a specific order?')
+#__all__ declaration for import *
+__all__ = [
+    'MakeMade',
+    'MakeTransformer',
+    'GenerateQuery',
+    'Query',
+    'ErrorMetric',
+    'args',
+    'DEVICE',
+]
 
-# MADE.
-parser.add_argument('--fc-hiddens',
-                    type=int,
-                    default=128,
-                    help='Hidden units in FC.')
-parser.add_argument('--layers', type=int, default=4, help='# layers in FC.')
-parser.add_argument('--residual', action='store_true', help='ResMade?')
-parser.add_argument('--direct-io', action='store_true', help='Do direct IO?')
-parser.add_argument(
-    '--inv-order',
-    action='store_true',
-    help='Set this flag iff using MADE and specifying --order. Flag --order'\
-    'lists natural indices, e.g., [0 2 1] means variable 2 appears second.'\
-    'MADE, however, is implemented to take in an argument the inverse '\
-    'semantics (element i indicates the position of variable i).  Transformer'\
-    ' does not have this issue and thus should not have this flag on.')
-parser.add_argument(
-    '--input-encoding',
-    type=str,
-    default='binary',
-    help='Input encoding for MADE/ResMADE, {binary, one_hot, embed}.')
-parser.add_argument(
-    '--output-encoding',
-    type=str,
-    default='one_hot',
-    help='Iutput encoding for MADE/ResMADE, {one_hot, embed}.  If embed, '
-    'then input encoding should be set to embed as well.')
+def _build_args_parser():
+    parser = argparse.ArgumentParser()
 
-# Transformer.
-parser.add_argument(
-    '--heads',
-    type=int,
-    default=0,
-    help='Transformer: num heads.  A non-zero value turns on Transformer'\
-    ' (otherwise MADE/ResMADE).'
-)
-parser.add_argument('--blocks',
-                    type=int,
-                    default=2,
-                    help='Transformer: num blocks.')
-parser.add_argument('--dmodel',
-                    type=int,
-                    default=32,
-                    help='Transformer: d_model.')
-parser.add_argument('--dff', type=int, default=128, help='Transformer: d_ff.')
-parser.add_argument('--transformer-act',
-                    type=str,
-                    default='gelu',
-                    help='Transformer activation.')
+    parser.add_argument('--inference-opts',
+                        action='store_true',
+                        help='Tracing optimization for better latency.')
 
-# Estimators to enable.
-parser.add_argument('--run-sampling',
-                    action='store_true',
-                    help='Run a materialized sampler?')
-parser.add_argument('--run-maxdiff',
-                    action='store_true',
-                    help='Run the MaxDiff histogram?')
-parser.add_argument('--run-bn',
-                    action='store_true',
-                    help='Run Bayes nets? If enabled, run BN only.')
+    parser.add_argument('--num-queries', type=int, default=20, help='# queries.')
+    parser.add_argument('--dataset', type=str, default='dmv-tiny', help='Dataset.')
+    parser.add_argument('--err-csv',
+                        type=str,
+                        default='results.csv',
+                        help='Save result csv to what path?')
+    parser.add_argument('--glob',
+                        type=str,
+                        help='Checkpoints to glob under models/.')
+    parser.add_argument('--blacklist',
+                        type=str,
+                        help='Remove some globbed checkpoint files.')
+    parser.add_argument('--psample',
+                        type=int,
+                        default=2000,
+                        help='# of progressive samples to use per query.')
+    parser.add_argument(
+        '--column-masking',
+        action='store_true',
+        help='Turn on wildcard skipping.  Requires checkpoints be trained with '\
+        'column masking.')
+    parser.add_argument('--order',
+                        nargs='+',
+                        type=int,
+                        help='Use a specific order?')
 
-# Bayes nets.
-parser.add_argument('--bn-samples',
-                    type=int,
-                    default=200,
-                    help='# samples for each BN inference.')
-parser.add_argument('--bn-root',
-                    type=int,
-                    default=0,
-                    help='Root variable index for chow liu tree.')
-# Maxdiff
-parser.add_argument(
-    '--maxdiff-limit',
-    type=int,
-    default=30000,
-    help='Maximum number of partitions of the Maxdiff histogram.')
+    # MADE.
+    parser.add_argument('--fc-hiddens',
+                        type=int,
+                        default=128,
+                        help='Hidden units in FC.')
+    parser.add_argument('--layers', type=int, default=4, help='# layers in FC.')
+    parser.add_argument('--residual', action='store_true', help='ResMade?')
+    parser.add_argument('--direct-io', action='store_true', help='Do direct IO?')
+    parser.add_argument(
+        '--inv-order',
+        action='store_true',
+        help='Set this flag iff using MADE and specifying --order. Flag --order'\
+        'lists natural indices, e.g., [0 2 1] means variable 2 appears second.'\
+        'MADE, however, is implemented to take in an argument the inverse '\
+        'semantics (element i indicates the position of variable i).  Transformer'\
+        ' does not have this issue and thus should not have this flag on.')
+    parser.add_argument(
+        '--input-encoding',
+        type=str,
+        default='binary',
+        help='Input encoding for MADE/ResMADE, {binary, one_hot, embed}.')
+    parser.add_argument(
+        '--output-encoding',
+        type=str,
+        default='one_hot',
+        help='Iutput encoding for MADE/ResMADE, {one_hot, embed}.  If embed, '
+        'then input encoding should be set to embed as well.')
 
-args = parser.parse_args()
+    # Transformer.
+    parser.add_argument(
+        '--heads',
+        type=int,
+        default=0,
+        help='Transformer: num heads.  A non-zero value turns on Transformer'\
+        ' (otherwise MADE/ResMADE).'
+    )
+    parser.add_argument('--blocks',
+                        type=int,
+                        default=2,
+                        help='Transformer: num blocks.')
+    parser.add_argument('--dmodel',
+                        type=int,
+                        default=32,
+                        help='Transformer: d_model.')
+    parser.add_argument('--dff', type=int, default=128, help='Transformer: d_ff.')
+    parser.add_argument('--transformer-act',
+                        type=str,
+                        default='gelu',
+                        help='Transformer activation.')
+
+    # Estimators to enable.
+    parser.add_argument('--run-sampling',
+                        action='store_true',
+                        help='Run a materialized sampler?')
+    parser.add_argument('--run-maxdiff',
+                        action='store_true',
+                        help='Run the MaxDiff histogram?')
+    parser.add_argument('--run-bn',
+                        action='store_true',
+                        help='Run Bayes nets? If enabled, run BN only.')
+
+    # Bayes nets.
+    parser.add_argument('--bn-samples',
+                        type=int,
+                        default=200,
+                        help='# samples for each BN inference.')
+    parser.add_argument('--bn-root',
+                        type=int,
+                        default=0,
+                        help='Root variable index for chow liu tree.')
+    # Maxdiff
+    parser.add_argument(
+        '--maxdiff-limit',
+        type=int,
+        default=30000,
+        help='Maximum number of partitions of the Maxdiff histogram.')
+
+    return parser
+
+args = None
 
 
 def InvertOrder(order):
@@ -159,18 +205,7 @@ def MakeTable():
     elif args.dataset == 'dmv':
         table = datasets.LoadDmv()
     elif args.dataset == 'tpch':
-        test_filename = '{}_test_split.csv'.format(args.dataset)
-        print(f'Loading strictly test data ({test_filename})... ')
-        test_df = pd.read_csv(os.path.join('./datasets', test_filename))
-        try:
-            with open('./datasets/tpch_train_table.pkl', 'rb') as f:
-                table = pickle.load(f)
-        except FileNotFoundError:
-            print("ERROR: tpch_train_table.pkl not found!")
-            print("Please run train_model.py first to generate the bins.")
-            raise
-        table.data = test_df    
-        table.cardinality = len(test_df)
+        table = datasets.LoadTpch('tpch_lineitem_10k.csv')
 
     oracle_est = estimators_lib.Oracle(table)
     if args.run_bn:
@@ -439,7 +474,6 @@ def MakeMade(scale, cols_to_train, seed, fixed_ordering=None):
     if args.inv_order:
         print('Inverting order!')
         fixed_ordering = InvertOrder(fixed_ordering)
-
     model = made.MADE(
         nin=len(cols_to_train),
         hidden_sizes=[scale] *
@@ -565,6 +599,9 @@ def Main():
                     seed=seed,
                     fixed_ordering=order,
                 )
+                print('Made MADE for dataset', args.dataset)
+                print('args.fc_hiddens', args.fc_hiddens)
+                print('table.columns', table.columns)
             else:
                 assert False, args.dataset
 
@@ -644,4 +681,6 @@ def Main():
 
 
 if __name__ == '__main__':
+    parser = _build_args_parser()
+    args = parser.parse_args()
     Main()
