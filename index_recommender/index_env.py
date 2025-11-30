@@ -10,7 +10,7 @@ import torch
 import numpy as np
 import gym
 from gym import spaces
-
+import eval_model
 # Import your existing modules
 import datasets
 import estimators as estimators_lib
@@ -35,6 +35,7 @@ class Config:
 class NaruEstimator:
     def __init__(self, model_path, device='cpu'):
         self.cfg = Config()
+        eval_model.args = self.cfg  # For compatibility with MakeMade
         self.device = device
         
         # 1. Load data (essential to know column metadata)
@@ -53,7 +54,7 @@ class NaruEstimator:
             scale=self.cfg.fc_hiddens,
             cols_to_train=self.table.columns,
             seed=0, 
-            fixed_ordering=None 
+            fixed_ordering=None
         ).to(device)
         
         # 3. Load trained weights
@@ -66,7 +67,7 @@ class NaruEstimator:
         self.estimator = estimators_lib.ProgressiveSampling(
             self.model,
             self.table,
-            num_samples=2000, # psample size
+            50, # psample size, in eval_model.py it's set to 2000, but it tremendously slows down the gym training process
             device=device,
             shortcircuit=self.cfg.column_masking
         )
@@ -83,7 +84,15 @@ class NaruEstimator:
         Returns:
             Estimated cardinality (int/float)
         """
-        card = self.estimator.Query(query_cols, query_ops, query_vals)
+        with torch.no_grad():
+            card_tensor = self.estimator.Query(query_cols, query_ops, query_vals)
+            
+            # Ensure we get a scalar value, not a tensor
+            if isinstance(card_tensor, torch.Tensor):
+                card = card_tensor.detach().cpu().item()
+            else:
+                card = float(card_tensor)
+        
         return card
 
 def calculate_cost(naru, query, current_indexes):
@@ -98,8 +107,15 @@ def calculate_cost(naru, query, current_indexes):
     cols, ops, vals = query
     
     # 1. Ask Naru for selectivity estimation
-    estimated_rows = naru.estimate_cardinality(cols, ops, vals)
-    total_rows = naru.table.cardinality
+    estimated_rows_raw = naru.estimate_cardinality(cols, ops, vals)
+
+    if hasattr(estimated_rows_raw, 'item'):
+        estimated_rows = float(estimated_rows_raw.item())
+    else:
+        estimated_rows = float(estimated_rows_raw)
+
+    total_rows = naru.table.cardinality  # Assuming 100% selectivity means all rows
+
     
     # Selectivity = (estimated rows) / (total rows)
     # This is the key metric provided by the neural network
@@ -117,9 +133,10 @@ def calculate_cost(naru, query, current_indexes):
         if is_index_applicable(index, cols):
             # Heuristic: Index Scan Cost ≈ log(N) + (Selected Rows)
             # We multiply by a factor (e.g., 0.1) to represent that index access is faster than scanning
-            index_scan_cost = (np.log2(total_rows) + estimated_rows) * 0.1
+            RANDOM_IO_PENALTY = 2.0
+            index_scan_cost = np.log2(total_rows) + (estimated_rows*RANDOM_IO_PENALTY)
             
-            if index_scan_cost < best_index_cost:
+            if index_scan_cost < best_index_cost:   
                 best_index_cost = index_scan_cost
                 
     return best_index_cost
@@ -212,11 +229,12 @@ class IndexEnv(gym.Env):
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         
         # Random generator for consistent workload generation
-        self.rng = np.random.Generator(np.random.PCG64(42))
+        self.rng = np.random.RandomState(42)
         
         # Episode length management
         self.current_step = 0
-        self.max_steps_per_episode = 50 
+        self.max_steps_per_episode = 50
+        self.current_query = None
 
     def step(self, action):
         """
@@ -232,7 +250,7 @@ class IndexEnv(gym.Env):
         
         # 2. Generate Workload (Query)
         # We generate a random query to evaluate the current index configuration
-        query = generate_workload_query(self.naru.table, self.rng, self.dataset_name)
+        #query = generate_workload_query(self.naru.table, self.rng, self.dataset_name) #IMPORTANT: This line causes non-determinism in the environment
         
         # 3. Calculate Cost (using Naru Estimator)
         # Identify which columns currently have an active index
@@ -244,16 +262,38 @@ class IndexEnv(gym.Env):
                 active_indexes.append([self.naru.table.columns[i].name])
         
         # Calculate the estimated cost of the query with the current indexes
-        cost = calculate_cost(self.naru, query, active_indexes)
+        #cost = calculate_cost(self.naru, query, active_indexes)
+
+        try:
+            raw_cost = calculate_cost(self.naru, self.current_query, active_indexes)
+        except Exception as e:
+            print(f"Warning: Cost calculation failed with error: {e}")
+            raw_cost = 10000000.0  # Assign a high cost on failure
         
+
+        if isinstance(raw_cost, torch.Tensor):
+            cost = float(raw_cost.item())
+        else:
+            cost = float(raw_cost)
+        
+        scaled_cost = cost / 1000.0  # Scale down for reward stability
+
         # 4. Compute Reward
         # RL agents maximize reward, so we use negative cost.
         # We add a penalty for maintaining too many indexes (storage/write overhead).
         # Penalty factor (e.g., 100.0) needs tuning based on cost magnitude.
-        maintenance_penalty = np.sum(self.state) * 50.0 
+        PENALTY_PER_INDEX = 0.5
+        penalty = np.sum(self.state) * PENALTY_PER_INDEX
         
-        reward = -cost - maintenance_penalty
-        
+        raw_reward = -scaled_cost - penalty
+        if isinstance(raw_reward, torch.Tensor):
+            # If PyTorch tensor, convert to float
+            reward = float(raw_reward.item())
+        else:
+            # Direct float conversion
+            reward = float(raw_reward)
+
+        reward = float(reward)
         # 5. Check Termination
         self.current_step += 1
         terminated = False
@@ -265,7 +305,7 @@ class IndexEnv(gym.Env):
         # Auxiliary information (useful for logging/debugging)
         info = {
             "query_cost": cost, 
-            "num_indexes": np.sum(self.state)
+            "num_indexes": float(np.sum(self.state))
         }
         
         # Return format for Gym API (v26+ uses terminated, truncated)
@@ -283,18 +323,25 @@ class IndexEnv(gym.Env):
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         self.current_step = 0
         
+        # Generate initial query for the new episode
+        self.current_query = generate_workload_query(self.naru.table, self.rng, self.dataset_name)
+
         # Return observation and empty info dict
         return self.state, {}
     
 if __name__ == "__main__":
     from stable_baselines3 import PPO
     from stable_baselines3.common.env_checker import check_env
+    from stable_baselines3.common.callbacks import ProgressBarCallback
     import os
 
     # Model file
     # IMPORTANT: Ensure this path matches where your trained model is saved.
     # You may need to adjust the pattern based on your training setup.
-    search_pattern = "models/tpch*.pt"
+    # Search in parent directory for models
+    parent_dir_main = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(parent_dir_main)  # Change working directory so datasets can be found
+    search_pattern = "models/tpch*.pt"  # Now use relative path since we're in parent dir
     found_files = glob.glob(search_pattern)
 
     # Check if any model files were found
@@ -319,6 +366,9 @@ if __name__ == "__main__":
         naru = NaruEstimator(model_path=MODEL_PATH, device=device)
         env = IndexEnv(naru)
         
+        # Re-enable gradients for training (ProgressiveSampling disables them)
+        torch.set_grad_enabled(True)
+        
         # Optional: Check if the environment follows Gym API standards
         print("Checking Gym environment compliance...")
         # check_env(env) # Uncomment to run strict checks
@@ -328,11 +378,12 @@ if __name__ == "__main__":
         
         # Initialize PPO (Proximal Policy Optimization) agent
         # MlpPolicy is suitable for vector inputs (our state)
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003)
+        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, tensorboard_log="./tensorboard_logs/")
         
         # Train the agent
         # total_timesteps determines how many interactions the agent has with the environment
-        model.learn(total_timesteps=10000)
+        print("Training for 10,000 timesteps...")
+        model.learn(total_timesteps=10000, callback=ProgressBarCallback())
         
         print("Training finished.")
         
@@ -349,7 +400,7 @@ if __name__ == "__main__":
             print(f"Step {i}: Action (Toggle Col {action}) -> Reward: {reward:.2f}, Indexes: {info['num_indexes']}")
             if done:
                 obs, _ = env.reset()
-
+    # Catch exceptions related to model loading
     except Exception as e:
         print(f"\nAn error occurred during execution: {e}")
         print("Tip: Make sure the model architecture in NaruEstimator (Config) matches the trained model.")
