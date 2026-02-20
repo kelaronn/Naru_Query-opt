@@ -318,7 +318,10 @@ class IndexEnv(gym.Env):
         Called at the beginning of each training episode.
         """
         super().reset(seed=seed)
-        
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+        else:
+            self.rng = np.random.RandomState()
         # Reset state to no indexes
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         self.current_step = 0
