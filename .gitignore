@@ -4,3 +4,6 @@ naru_env/
 *.pt
 *.pth
 *.ckpt
+*.pdf
+*.txt
+/extract_pdfs.py

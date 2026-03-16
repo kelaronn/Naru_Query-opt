@@ -1,0 +1,7 @@
+{
+    "venvPath": "${workspaceFolder}",
+    "venv": "naru_env",
+    "extraPaths": [
+        "${workspaceFolder}"
+    ]
+}

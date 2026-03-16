@@ -61,7 +61,7 @@ def main():
     
     # Reset environment to get a FRESH set of queries (workload)
     # The agent has never seen these specific queries before
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=42)
     
     # Get column names for better logging
     col_names = [c.name for c in naru.table.columns]
@@ -79,8 +79,18 @@ def main():
         obs, reward, done, _, info = env.step(action)
         
         # --- Logging Results ---
-        # Decode action to column name
-        target_col = col_names[action]
+        # Decode action to column name and action type
+        if action == len(col_names) * 2:
+            action_type = "STOP"
+            target_col = "Optimization Finished"
+        elif action < len(col_names):
+            action_type = "Create Index"
+            target_col = col_names[action]
+        else:
+            action_type = "Drop Index"
+            target_col = col_names[action - len(col_names)]
+            
+        action_str = f"{action_type} ({target_col})"
         
         # Decode observation (state) to list of active indexes
         # obs is a binary vector: [0, 1, 0, ...] -> 1 means index is active
@@ -89,7 +99,7 @@ def main():
         # Format the active indexes list as a string
         active_str = ", ".join(active_indexes) if active_indexes else "None"
         
-        print(f"{i+1:<6} | {target_col:<25} | {reward:<15.4f} | {active_str}")
+        print(f"{i+1:<6} | {action_str:<25} | {reward:<15.4f} | {active_str}")
         
         if done:
             print("Episode finished early.")

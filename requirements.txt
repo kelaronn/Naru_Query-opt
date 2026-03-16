@@ -3,3 +3,6 @@ pandas==2.2.3
 torch==2.9.0
 torchvision==0.24.0
 scipy==1.14.1
+gym
+stable_baselines3
+tensorboard

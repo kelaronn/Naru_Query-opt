@@ -209,9 +209,7 @@ class CsvTable(Table):
                 data[col] = data[col].astype(typ, copy=False)
             else:
                 # Both infer_datetime_format and cache are critical for perf.
-                data[col] = pd.to_datetime(data[col],
-                                           infer_datetime_format=True,
-                                           cache=True)
+                data[col] = pd.to_datetime(data[col], cache=True)
 
         # Discretize & create Columns.
         if cols is None:

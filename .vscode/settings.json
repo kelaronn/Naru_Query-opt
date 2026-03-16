@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/naru_env/Scripts/python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "python.analysis.venvPath": "${workspaceFolder}",
+    "python.analysis.venv": "naru_env"
+}

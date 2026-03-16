@@ -1,0 +1,11 @@
+{
+  "source_directories": [
+    "."
+  ],
+  "search_path": [
+    "naru_env/Lib/site-packages",
+    "naru_env/Scripts",
+    "models",
+    "index_recommender"
+  ]
+}

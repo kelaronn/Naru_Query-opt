@@ -11,10 +11,8 @@ import numpy as np
 import gym
 from gym import spaces
 import eval_model
-# Import your existing modules
 import datasets
 import estimators as estimators_lib
-# Assuming made.py, transformer.py, etc., are in the same folder
 from eval_model import MakeMade, GenerateQuery
 
 
@@ -211,9 +209,11 @@ class IndexEnv(gym.Env):
         # --- Define Action and Observation Spaces ---
         
         # Action Space: Discrete choice.
-        # The agent chooses an integer 'i' (0 to n_cols-1).
-        # This action toggles the index on the i-th column (Create <-> Drop).
-        self.action_space = gym.spaces.Discrete(self.n_cols)
+        # The agent chooses an integer 'i' (0 to 2 * n_cols).
+        # Actions 0 to n_cols-1: Create Index on column 'i'.
+        # Actions n_cols to 2*n_cols-1: Drop Index on column 'i - n_cols'.
+        # Action 2 * n_cols: STOP (Finish optimization early).
+        self.action_space = gym.spaces.Discrete(self.n_cols * 2 + 1)
         
         # Observation Space: Binary vector.
         # Represents the current configuration: [0, 1, 0, ...]
@@ -229,77 +229,116 @@ class IndexEnv(gym.Env):
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         
         # Random generator for consistent workload generation
-        self.rng = np.random.RandomState(42)
+        self.rng = np.random.RandomState(42)  # Seeded for determinism
         
+        # Generate a deterministic workload of M queries
+        self.workload_size = 10
+        self.workload = []
+        for _ in range(self.workload_size):
+            self.workload.append(generate_workload_query(self.naru.table, self.rng, self.dataset_name))
+            
+        # Pre-calculate baseline cost (Average Cost with NO Indexes)
+        self.baseline_cost = 0.0
+        for q in self.workload:
+            c = calculate_cost(self.naru, q, [])
+            if isinstance(c, torch.Tensor):
+                self.baseline_cost += float(c.item())
+            else:
+                self.baseline_cost += float(c)
+        self.baseline_cost /= self.workload_size
+        print(f"Environment initialized with deterministic workload of size {self.workload_size}. Baseline Average Cost: {self.baseline_cost:.2f}")
+
         # Episode length management
         self.current_step = 0
         self.max_steps_per_episode = 50
-        self.current_query = None
 
     def step(self, action):
         """
         Executes one step in the environment.
-        1. Applies the action (update index config).
-        2. Generates a workload (query).
-        3. Calculates cost (reward).
+        1. Applies the action (Explicit Create/Drop Index, or STOP).
+        2. Evaluates the fixed workload.
+        3. Calculates reward based on relative improvement against baseline, with strict invalid action penalties.
         """
         
-        # 1. Update State (Toggle index status)
-        # If 0 -> 1 (Create Index), If 1 -> 0 (Drop Index)
-        self.state[action] = 1.0 - self.state[action]
+        invalid_step = False
+        terminated = False
         
-        # 2. Generate Workload (Query)
-        # We generate a random query to evaluate the current index configuration
-        #query = generate_workload_query(self.naru.table, self.rng, self.dataset_name) #IMPORTANT: This line causes non-determinism in the environment
+        # 1. Update State (Create/Drop Index/Stop)
+        if action == self.n_cols * 2:
+            # Action: STOP
+            terminated = True
+        elif action < self.n_cols:
+            # Action: Create Index
+            if self.state[action] == 1.0:
+                # Already exists - invalid action
+                invalid_step = True
+            else:
+                self.state[action] = 1.0
+        else:
+            # Action: Drop Index
+            target_col = action - self.n_cols
+            if self.state[target_col] == 0.0:
+                # Does not exist - invalid action
+                invalid_step = True
+            else:
+                self.state[target_col] = 0.0
         
-        # 3. Calculate Cost (using Naru Estimator)
+        # 3. Calculate Cost (using Naru Estimator) over the entire Workload
         # Identify which columns currently have an active index
         active_indexes = []
         for i, has_index in enumerate(self.state):
             if has_index == 1.0:
-                # For simplicity, we assume single-column indexes here.
-                # Complex composite indexes would require a larger action space.
                 active_indexes.append([self.naru.table.columns[i].name])
         
-        # Calculate the estimated cost of the query with the current indexes
-        #cost = calculate_cost(self.naru, query, active_indexes)
+        # Calculate the average cost of the deterministic workload
+        total_cost = 0.0
+        for current_query in self.workload:
+            try:
+                raw_cost = calculate_cost(self.naru, current_query, active_indexes)
+            except Exception as e:
+                print(f"Warning: Cost calculation failed with error: {e}")
+                # Use a moderately high cost on failure so we don't destroy gradients
+                raw_cost = self.baseline_cost * 2.0 if self.baseline_cost > 0 else 10000.0
 
-        try:
-            raw_cost = calculate_cost(self.naru, self.current_query, active_indexes)
-        except Exception as e:
-            print(f"Warning: Cost calculation failed with error: {e}")
-            raw_cost = 10000000.0  # Assign a high cost on failure
-        
+            if isinstance(raw_cost, torch.Tensor):
+                cost = float(raw_cost.item())
+            else:
+                cost = float(raw_cost)
+            total_cost += cost
 
-        if isinstance(raw_cost, torch.Tensor):
-            cost = float(raw_cost.item())
+        avg_workload_cost = total_cost / self.workload_size
+
+        # 4. Compute Reward (Reward Shaping)
+        # We calculate relative cost against the No-Index baseline cost.
+        # Cost ratio will be around 1.0 when no indexes are used, and < 1.0 when good indexes are used.
+        if self.baseline_cost > 0:
+            cost_ratio = avg_workload_cost / self.baseline_cost
         else:
-            cost = float(raw_cost)
-        
-        scaled_cost = cost / 1000.0  # Scale down for reward stability
+            cost_ratio = 1.0
 
-        # 4. Compute Reward
-        # RL agents maximize reward, so we use negative cost.
-        # We add a penalty for maintaining too many indexes (storage/write overhead).
-        # Penalty factor (e.g., 100.0) needs tuning based on cost magnitude.
-        PENALTY_PER_INDEX = 0.5
+        # We add a penalty for maintaining too many indexes.
+        # Tuned penalty to be relative to the [-1.0, 0.0] scale.
+        PENALTY_PER_INDEX = 0.05  # Each index costs 5% of the baseline cost in penalty
         penalty = np.sum(self.state) * PENALTY_PER_INDEX
         
-        raw_reward = -scaled_cost - penalty
-        if isinstance(raw_reward, torch.Tensor):
-            # If PyTorch tensor, convert to float
-            reward = float(raw_reward.item())
-        else:
-            # Direct float conversion
-            reward = float(raw_reward)
+        # RL agents maximize reward, so we use negative cost ratio.
+        # Reward will typically start around -1.0 and move towards ~0.0
+        reward = float(-cost_ratio - penalty)
+        
+        # Add a massive penalty for taking an invalid action (idempotent loops)
+        if invalid_step:
+            reward = -2.0  # High relative punishment
+            terminated = True # Force early exit so it can't farm bad states
+            
+        # Add a very small reward bonus for stopping early to lock in good indexes
+        if terminated and not invalid_step:
+            reward += 0.5 # Give a stronger incentive to use the STOP button
 
-        reward = float(reward)
         # 5. Check Termination
         self.current_step += 1
-        terminated = False
         truncated = self.current_step >= self.max_steps_per_episode
         
-        # Combine terminated and truncated for 'done' flag (compatibility with older Gym/SB3)
+        # Combine terminated and truncated for 'done' flag
         done = terminated or truncated
         
         # Auxiliary information (useful for logging/debugging)
@@ -318,16 +357,11 @@ class IndexEnv(gym.Env):
         Called at the beginning of each training episode.
         """
         super().reset(seed=seed)
-        if seed is not None:
-            self.rng = np.random.RandomState(seed)
-        else:
-            self.rng = np.random.RandomState()
+        # The workload generation is now completely separated and deterministic (done in __init__).
+        # State resetting is just putting indexes back to zero.
         # Reset state to no indexes
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         self.current_step = 0
-        
-        # Generate initial query for the new episode
-        self.current_query = generate_workload_query(self.naru.table, self.rng, self.dataset_name)
 
         # Return observation and empty info dict
         return self.state, {}
@@ -396,11 +430,19 @@ if __name__ == "__main__":
         
         # Simple test run
         obs, _ = env.reset()
-        print("\nTesting trained agent:")
+        print("\nTesting untrained agent (10 random baseline steps) just to verify mechanics:")
         for i in range(10):
             action, _states = model.predict(obs, deterministic=True)
             obs, reward, done, _, info = env.step(action)
-            print(f"Step {i}: Action (Toggle Col {action}) -> Reward: {reward:.2f}, Indexes: {info['num_indexes']}")
+            
+            if action == env.n_cols * 2:
+                action_type = "STOP"
+                target_col = "Optimization Complete"
+            else:
+                action_type = "Create" if action < env.n_cols else "Drop"
+                target_col = env.naru.table.columns[action % env.n_cols].name
+            
+            print(f"Step {i+1}: Action ({action_type} '{target_col}') -> Reward (Cost Ratio & Penalty): {reward:.4f}, Active Indexes: {info['num_indexes']}")
             if done:
                 obs, _ = env.reset()
     # Catch exceptions related to model loading
