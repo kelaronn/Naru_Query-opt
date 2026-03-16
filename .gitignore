@@ -1,9 +1,9 @@
 __pycache__
 .DS_Store
 naru_env/
+extract_pdfs.py
 *.pt
 *.pth
 *.ckpt
 *.pdf
 *.txt
-/extract_pdfs.py
