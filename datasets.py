@@ -52,3 +52,35 @@ def LoadTpch(filename='tpch_lineitem_10k.csv'):
         'L_RECEIPTDATE': np.datetime64,
     }
     return common.CsvTable('TPCH_LINEITEM', csv_file, cols, type_casts)
+
+def LoadTpchFromPostgres(db_url='postgresql://postgres:postgres@localhost:5432/naru_db', table_name='lineitem'):
+    """Loads TPC-H data directly from a PostgreSQL database using pandas."""
+    import pandas as pd
+    from sqlalchemy import create_engine
+    
+    engine = create_engine(db_url)
+    cols = [
+        'L_LINENUMBER',
+        'L_QUANTITY', 
+        'L_DISCOUNT', 
+        'L_TAX',
+        'L_RETURNFLAG', 
+        'L_LINESTATUS', 
+        'L_SHIPDATE', 
+        'L_COMMITDATE',
+        'L_RECEIPTDATE', 
+        'L_SHIPINSTRUCT', 
+        'L_SHIPMODE',
+    ]
+    
+    print(f"Loading '{table_name}' from PostgreSQL...")
+    df = pd.read_sql_table(table_name, engine, columns=cols)
+    
+    type_casts = {
+        'L_SHIPDATE': np.datetime64,
+        'L_COMMITDATE': np.datetime64,
+        'L_RECEIPTDATE': np.datetime64,
+    }
+    
+    # We can reuse CsvTable because it accepts a DataFrame instead of a filename
+    return common.CsvTable('TPCH_LINEITEM_PG', df, cols=None, type_casts=type_casts)

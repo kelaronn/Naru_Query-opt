@@ -9,7 +9,7 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 os.chdir(parent_dir)  # Munkakönyvtár = szülőkönyvtár (ahol a datasets/ van)
 
-from stable_baselines3 import PPO
+from stable_baselines3 import DQN
 
 # Import the environment and estimator from your existing file
 # Ensure index_env.py is in the same directory!
@@ -44,8 +44,8 @@ def main():
     torch.set_grad_enabled(True)
     
     # --- 2. Load the Trained Agent ---
-    print("Loading Trained PPO Agent...")
-    agent_path = os.path.join(os.path.dirname(__file__), "index_advisor_ppo")
+    print("Loading Trained DQN Agent...")
+    agent_path = os.path.join(parent_dir, "index_advisor_dqn")
     
     if not os.path.exists(f"{agent_path}.zip"):
         print(f"Error: Trained agent file '{agent_path}.zip' not found.")
@@ -53,7 +53,7 @@ def main():
         return
 
     # Load the model from the zip file
-    model = PPO.load(agent_path)
+    model = DQN.load(agent_path)
 
     # --- 3. Testing (Inference Loop) ---
     print("\n=== STARTING INFERENCE TEST ===")

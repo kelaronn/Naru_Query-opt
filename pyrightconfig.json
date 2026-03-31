@@ -1,4 +1,5 @@
 {
+    "python.defaultInterpreterPath": "c:\\Users\\karon\\Desktop\\Egyetem\\onlab\\Naru_Query-opt\\naru_env\\Scripts\\python.exe",
     "venvPath": "${workspaceFolder}",
     "venv": "naru_env",
     "extraPaths": [

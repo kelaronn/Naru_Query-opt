@@ -6,3 +6,5 @@ scipy==1.14.1
 gym
 stable_baselines3
 tensorboard
+psycopg2-binary
+sqlalchemy

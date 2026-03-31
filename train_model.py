@@ -21,6 +21,7 @@ parser = argparse.ArgumentParser()
 
 # Training.
 parser.add_argument('--dataset', type=str, default='dmv-tiny', help='Dataset.')
+parser.add_argument('--db-url', type=str, default='postgresql://postgres:postgres@localhost:5432/naru_db', help='PostgreSQL connection string.')
 parser.add_argument('--num-gpus', type=int, default=0, help='#gpus.')
 parser.add_argument('--bs', type=int, default=1024, help='Batch size.')
 parser.add_argument(
@@ -332,13 +333,15 @@ def TrainTask(seed=0):
     torch.manual_seed(0)
     np.random.seed(0)
 
-    assert args.dataset in ['dmv-tiny', 'dmv', 'tpch']
+    assert args.dataset in ['dmv-tiny', 'dmv', 'tpch', 'tpch_pg']
     if args.dataset == 'dmv-tiny':
         table = datasets.LoadDmv('dmv-tiny.csv')
     elif args.dataset == 'dmv':
         table = datasets.LoadDmv()
     elif args.dataset == 'tpch':
         table = datasets.LoadTpch('tpch_lineitem_10k.csv')
+    elif args.dataset == 'tpch_pg':
+        table = datasets.LoadTpchFromPostgres(db_url=args.db_url)
 
     table_bits = Entropy(
         table,
@@ -359,7 +362,7 @@ def TrainTask(seed=0):
                                 fixed_ordering=fixed_ordering,
                                 seed=seed)
     else:
-        if args.dataset in ['dmv-tiny', 'dmv', 'tpch']:
+        if args.dataset in ['dmv-tiny', 'dmv', 'tpch', 'tpch_pg']:
             model = MakeMade(
                 scale=args.fc_hiddens,
                 cols_to_train=table.columns,
