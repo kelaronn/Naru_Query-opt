@@ -84,7 +84,7 @@ class NaruEstimator:
                 card = float(card_tensor)
         return card
 
-def calculate_cost(naru, query, pg_conn=None, analyze=False):
+def calculate_cost(naru, query, pg_conn=None, analyze=False, table_name='lineitem'):
     """
     Calculates the execution cost of a query using PostgreSQL's EXPLAIN.
     If analyze is True, executes the query and returns Actual Execution Time (ms).
@@ -110,9 +110,9 @@ def calculate_cost(naru, query, pg_conn=None, analyze=False):
     where_str = " AND ".join(where_clauses)
     
     if analyze:
-        sql_query = f"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM lineitem WHERE {where_str};"
+        sql_query = f"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM {table_name} WHERE {where_str};"
     else:
-        sql_query = f"EXPLAIN (FORMAT JSON) SELECT * FROM lineitem WHERE {where_str};"
+        sql_query = f"EXPLAIN (FORMAT JSON) SELECT * FROM {table_name} WHERE {where_str};"
     
     try:
         with pg_conn.cursor() as cur:
@@ -194,6 +194,8 @@ class IndexEnv(gym.Env):
         self.naru = naru_estimator
         self.dataset_name = self.naru.cfg.dataset
         self.n_cols = len(self.naru.table.columns)
+        # Table name used in all SQL statements — change here if you switch datasets.
+        self.table_name = 'lineitem'
         
         self.action_space = gym.spaces.Discrete(self.n_cols * 2 + 1)
         self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.n_cols,), dtype=np.float32)
@@ -211,93 +213,83 @@ class IndexEnv(gym.Env):
             # Drop all potential RL indexes before starting
             with self.pg_conn.cursor() as cur:
                 for col in self.naru.table.columns:
-                    cur.execute(f"DROP INDEX IF EXISTS idx_rl_{col.name.lower()};")
+                    cur.execute(f"DROP INDEX IF EXISTS idx_rl_{self.table_name}_{col.name.lower()};");
         except Exception as e:
             print(f"Failed to connect to PostgreSQL: {e}")
             self.pg_conn = None
 
-        # Generate a deterministic workload of M queries
+        # Generate dynamic workload
         self.workload_size = 10
         self.workload = []
-        for _ in range(self.workload_size):
-            self.workload.append(generate_workload_query(self.naru.table, self.rng, self.dataset_name))
-            
-        # State: 1 (tanulás NARU alapon), 2 (finomhangolás Postgres alapon)
-        self.training_phase = 1 
         
-        # Pre-calculate baseline cost (Average Cost with NO Indexes) for both phases
+        # Pre-declare baseline variables
         self.baseline_cost_pg_time = 0.0
         self.baseline_cost_naru = 0.0
-        empty_index_state = np.zeros(self.n_cols, dtype=np.float32)
+        self.penalty_per_index = 0.0
         
-        for q in self.workload:
-            c_pg = calculate_cost(self.naru, q, pg_conn=self.pg_conn, analyze=True)
-            self.baseline_cost_pg_time += float(c_pg)
-            c_naru = estimate_cost_with_naru(self.naru, q, empty_index_state)
-            self.baseline_cost_naru += float(c_naru)
-            
-        self.baseline_cost_pg_time /= self.workload_size
-        self.baseline_cost_naru /= self.workload_size
+        # Compute the penalty scaling factor (alpha) once (database parameter)
+        self.alpha = self._compute_alpha()
+
+        # Generate the initial workload and calculate baselines
+        self._generate_dynamic_workload()
         
-        print(f"Environment initialized with deterministic workload of size {self.workload_size}.")
-        print(f"Baseline Time (PG Analyze): {self.baseline_cost_pg_time:.2f} ms, Baseline Cost (NARU): {self.baseline_cost_naru:.2f}")
+        # State: 1 (tanulás NARU alapon), 2 (finomhangolás Postgres alapon)
+        self.training_phase = 1 
 
         self.current_step = 0
         self.max_steps_per_episode = 50
 
     def step(self, action):
-        invalid_step = False
         terminated = False
-        
+
         # 1. Update State (Create/Drop Index/Stop)
+        # NOTE: illegal actions (create where index exists, drop where none exists)
+        # are prevented at the algorithm level via action_masks(). This branch
+        # acts as a silent safety-net only — it should never be reached during
+        # normal MaskablePPO training.
         if action == self.n_cols * 2:
             terminated = True
         elif action < self.n_cols:
-            if self.state[action] == 1.0:
-                invalid_step = True
-            else:
+            if self.state[action] == 0.0:   # safety: only act if truly valid
                 self.state[action] = 1.0
                 col_name = self.naru.table.columns[action].name
-                index_name = f"idx_rl_{col_name.lower()}"
+                index_name = f"idx_rl_{self.table_name}_{col_name.lower()}"
                 if self.training_phase == 2 and self.pg_conn:
                     try:
                         with self.pg_conn.cursor() as cur:
-                            cur.execute(f'CREATE INDEX IF NOT EXISTS {index_name} ON lineitem ("{col_name}");')
+                            cur.execute(f'CREATE INDEX IF NOT EXISTS {index_name} ON {self.table_name} ("{col_name}");')
                     except Exception as e:
                         print(f"Failed to create index {index_name}: {e}")
         else:
             target_col = action - self.n_cols
-            if self.state[target_col] == 0.0:
-                invalid_step = True
-            else:
+            if self.state[target_col] == 1.0:  # safety: only act if truly valid
                 self.state[target_col] = 0.0
                 col_name = self.naru.table.columns[target_col].name
-                index_name = f"idx_rl_{col_name.lower()}"
+                index_name = f"idx_rl_{self.table_name}_{col_name.lower()}"
                 if self.training_phase == 2 and self.pg_conn:
                     try:
                         with self.pg_conn.cursor() as cur:
                             cur.execute(f"DROP INDEX IF EXISTS {index_name};")
                     except Exception as e:
                         print(f"Failed to drop index {index_name}: {e}")
-        
+
         # 3. Calculate Cost using PostgreSQL EXPLAIN over the Workload
         total_value = 0.0
-        
+
         for current_query in self.workload:
             try:
                 if self.training_phase == 1:
                     raw_val = estimate_cost_with_naru(self.naru, current_query, self.state)
                 else:
-                    raw_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True)
+                    raw_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
             except Exception as e:
-                # Büntetés hiba esetén
                 raw_val = (self.baseline_cost_naru * 2.0) if self.training_phase == 1 else (self.baseline_cost_pg_time * 2.0)
             total_value += float(raw_val)
 
         avg_workload_val = total_value / self.workload_size
 
         # Skálázási trükk: a Phase 2-es (ms) időket leképezzük a Phase 1-es (NARU) nagyságrendre!
-        # Így a DQN Q-értékei nem zavarodnak meg a fázisváltáskor.
+        # Így a PPO nem zavarodnak meg a fázisváltáskor.
         if self.training_phase == 2:
             time_ratio = avg_workload_val / self.baseline_cost_pg_time
             scaled_cost = time_ratio * self.baseline_cost_naru
@@ -309,31 +301,138 @@ class IndexEnv(gym.Env):
         # 4. Compute Reward (Reward Shaping) - Improvement over baseline
         improvement = current_baseline_scaled - scaled_cost
 
-        # Penalty for maintaining too many indexes. 5% of baseline cost per index.
-        PENALTY_PER_INDEX = current_baseline_scaled * 0.05
-        penalty = np.sum(self.state) * PENALTY_PER_INDEX
-        
+        # Penalty: theoretically calibrated I/O overhead per B-Tree index (see _compute_penalty_per_index)
+        penalty = np.sum(self.state) * self.penalty_per_index
+
         reward = float(improvement - penalty)
-        
-        if invalid_step:
-            # Huge penalty relative to baseline
-            reward = float(-current_baseline_scaled * 2.0)
-            terminated = True
-            
-        if terminated and not invalid_step:
-            # Small bonus for cleanly stopping
+
+        if terminated:
+            # Small bonus for choosing STOP cleanly
             reward += float(current_baseline_scaled * 0.1)
 
         self.current_step += 1
         truncated = self.current_step >= self.max_steps_per_episode
         done = terminated or truncated
-        
+
         info = {
-            "query_cost": float(avg_workload_val), 
+            "query_cost": float(avg_workload_val),
             "num_indexes": float(np.sum(self.state))
         }
-        
+
         return self.state, reward, done, False, info
+
+    def _generate_dynamic_workload(self):
+        """
+        Generates a new random workload and calculates the corresponding 
+        baseline costs (cost without any indexes) and penalty logic.
+        Called in __init__ and at the start of every episode in reset().
+        """
+        self.workload = []
+        for _ in range(self.workload_size):
+            self.workload.append(generate_workload_query(self.naru.table, self.rng, self.dataset_name))
+            
+        self.baseline_cost_pg_time = 0.0
+        self.baseline_cost_naru = 0.0
+        empty_index_state = np.zeros(self.n_cols, dtype=np.float32)
+        
+        for q in self.workload:
+            c_pg = calculate_cost(self.naru, q, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
+            self.baseline_cost_pg_time += float(c_pg)
+            c_naru = estimate_cost_with_naru(self.naru, q, empty_index_state)
+            self.baseline_cost_naru += float(c_naru)
+            
+        self.baseline_cost_pg_time /= self.workload_size
+        self.baseline_cost_naru /= self.workload_size
+        
+        # Recalculate penalty for this specific workload's baseline
+        self.penalty_per_index = float(self.baseline_cost_naru * self.alpha)
+
+    def _compute_alpha(self) -> float:
+        """
+        Computes alpha, the ratio of B-Tree sequential maintenance overhead,
+        based on PostgreSQL configuration and table size. 
+        Only needs to be computed once at initialization.
+        """
+        AVG_BTREE_ENTRY_BYTES = 10   # 6-byte ItemId pointer + ~4 byte key (int/date/float)
+        BTREE_FILL_FACTOR     = 0.9  # PostgreSQL B-Tree fillfactor
+
+        rpc         = 1.1    # SSD default (random_page_cost)
+        spc         = 1.0    # seq_page_cost default
+        block_size  = 8192
+        n_rows      = len(self.naru.table.data)
+        # Fallback: estimate table_pages from in-memory data assuming ~100 B/row average
+        AVG_ROW_BYTES_FALLBACK = 100
+        table_pages = max(1, int(np.ceil(n_rows * AVG_ROW_BYTES_FALLBACK / block_size)))
+
+        if self.pg_conn:
+            try:
+                with self.pg_conn.cursor() as cur:
+                    cur.execute("SHOW random_page_cost;")
+                    rpc = float(cur.fetchone()[0])
+
+                    cur.execute("SHOW seq_page_cost;")
+                    spc = float(cur.fetchone()[0])
+
+                    cur.execute("SHOW block_size;")
+                    block_size = int(cur.fetchone()[0])
+
+                    # reltuples and relpages are O(1) — updated by ANALYZE, no full scan.
+                    cur.execute(
+                        "SELECT reltuples::BIGINT, relpages::BIGINT FROM pg_class "
+                        "WHERE relname = %s AND relkind = 'r';",
+                        (self.table_name,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        if int(row[0]) > 0:
+                            n_rows = int(row[0])
+                        if int(row[1]) > 0:
+                            table_pages = int(row[1])
+            except Exception as e:
+                print(f"[Penalty Calibration] Warning: PG parameter query failed ({e}). "
+                      "Using SSD defaults and in-memory estimates.")
+
+        # Effective usable bytes per index page (fillfactor accounts for B-Tree splits)
+        usable_bytes_per_index_page = block_size * BTREE_FILL_FACTOR
+        index_pages = max(1, int(np.ceil(n_rows * AVG_BTREE_ENTRY_BYTES
+                                         / usable_bytes_per_index_page)))
+
+        # α: fraction of the sequential full-table-scan cost that one index's
+        #    random I/O overhead represents.
+        #    Denominator: table_pages × spc  (spc is per PAGE, not per row!)
+        alpha = (index_pages * rpc) / max(table_pages * spc, 1.0)
+
+        print(
+            f"[Penalty Calibration] table={self.table_name}, n_rows={n_rows:,}, "
+            f"table_pages={table_pages}, index_pages={index_pages} "
+            f"(fill={BTREE_FILL_FACTOR}), rpc={rpc}, spc={spc}, "
+            f"block_size={block_size}B, alpha={alpha:.5f} "
+            f"(= {alpha*100:.3f}% of NARU baseline per index)"
+        )
+        return float(alpha)
+
+    def action_masks(self) -> np.ndarray:
+        """
+        Returns a boolean mask of currently valid actions.
+
+        Used by MaskablePPO (sb3-contrib) to eliminate illegal moves before
+        action sampling and Q/policy network inference — the agent never even
+        sees an illegal action in its probability distribution.
+
+        Action encoding
+        ---------------
+        [0,       n_cols)   CREATE index on column i  — valid iff state[i] == 0
+        [n_cols, 2*n_cols)  DROP   index on column i  — valid iff state[i] == 1
+        [2*n_cols]          STOP                       — always valid
+        """
+        mask = np.zeros(self.n_cols * 2 + 1, dtype=bool)
+        for i in range(self.n_cols):
+            if self.state[i] == 0.0:
+                mask[i] = True               # CREATE valid: slot is empty
+            else:
+                mask[self.n_cols + i] = True  # DROP  valid: slot is occupied
+        mask[self.n_cols * 2] = True          # STOP is always a legal choice
+        return mask
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -342,10 +441,13 @@ class IndexEnv(gym.Env):
         if self.training_phase == 2 and self.pg_conn:
             with self.pg_conn.cursor() as cur:
                 for col in self.naru.table.columns:
-                    cur.execute(f"DROP INDEX IF EXISTS idx_rl_{col.name.lower()};")
+                    cur.execute(f"DROP INDEX IF EXISTS idx_rl_{self.table_name}_{col.name.lower()};")
 
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         self.current_step = 0
+        
+        # Dynamically sample a fresh 10 queries and compute their un-indexed baselines
+        self._generate_dynamic_workload()
 
         return self.state, {}
     
@@ -355,7 +457,37 @@ class IndexEnv(gym.Env):
         super().close()
 
 if __name__ == "__main__":
-    from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import ProgressBarCallback
+    
+    # --- Custom DQN Action Masking ---
+    class MaskedDQN(DQN):
+        """
+        A custom DQN wrapper that enforces action masking during both:
+        1. Epsilon-greedy exploration (sample from valid actions only)
+        2. Q-value inference (argmax over valid actions only)
+        """
+        def predict(self, observation, state=None, episode_start=None, deterministic=False):
+            # 1. Get the action mask from the unwrapped environment
+            env = self.get_env().envs[0]
+            mask = env.unwrapped.action_masks()
+            
+            # 2. Get Q-values from the neural network
+            observation_tensor = torch.as_tensor(observation).reshape(1, -1).to(self.device)
+            with torch.no_grad():
+                q_values = self.q_net(observation_tensor).cpu().numpy()[0]
+            
+            # 3. Apply the mask: set Q-values of illegal actions to -infinity
+            q_values[~mask] = -np.inf
+            
+            # 4. Epsilon-greedy exploration (if not deterministic)
+            if not deterministic and np.random.rand() < self.exploration_rate:
+                valid_actions = np.where(mask)[0]
+                action = np.random.choice(valid_actions)
+            else:
+                # Argmax over the masked Q-values (legal actions only)
+                action = np.argmax(q_values)
+                
+            return np.array([action]), None
     from stable_baselines3.common.callbacks import ProgressBarCallback
     
     parent_dir_main = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -379,19 +511,17 @@ if __name__ == "__main__":
     try:
         naru = NaruEstimator(model_path=MODEL_PATH, device=device)
         env = IndexEnv(naru)
-        
         torch.set_grad_enabled(True)
-        
-        print("\n--- PHASE 1: Traning based on NARU estimated costs ---")
+
+        print("\n--- PHASE 1: Training based on NARU estimated costs ---")
         env.training_phase = 1
-        
-        # RL Model cseréje PPO-ról DQN-re
-        # A DQN egy off-policy algoritmus, replay bufferrel és Q-hálózattal. Diszkrét téren kiváló.
-        model = DQN(
-            "MlpPolicy", 
-            env, 
-            verbose=1, 
-            learning_rate=0.0005, 
+
+        # Using our customized DQN that respects the action_masks() function
+        model = MaskedDQN(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=0.0005,
             buffer_size=50000,
             learning_starts=1000,
             batch_size=64,
@@ -401,7 +531,7 @@ if __name__ == "__main__":
         
         # Leghatékonyabb megoldás: Egyedi logger, ami egyetlen timestamp mappába gyűjti mindkét fázist
         # A 'log' a txt/log szöveges mentést, a 'csv' a táblázatos mentést készíti a folyamatsávról
-        run_name = f"DQN_Run_{int(time.time())}"
+        run_name = f"DQN_Masked_Run_{int(time.time())}"
         log_dir = f"./tensorboard_logs/{run_name}"
         custom_logger = configure(log_dir, ["stdout", "tensorboard", "log", "csv"])
         model.set_logger(custom_logger)
@@ -418,14 +548,15 @@ if __name__ == "__main__":
         print("Training for 1,000 timesteps using Postgres Database...")
         # Reset_num_timesteps=False, hogy lássuk a görbén a folytatást (tb log)
         model.learn(total_timesteps=1000, callback=ProgressBarCallback(), reset_num_timesteps=False)
-        
+
         print("Training finished.")
-        model.save("index_advisor_dqn")
-        print("Agent saved to 'index_advisor_dqn.zip'")
+        model.save("index_advisor_dqn_masked")
+        print("Agent saved to 'index_advisor_dqn_masked.zip'")
         
         obs, _ = env.reset()
-        print("\nTesting trained agent (10 random steps):")
+        print("\nTesting trained agent (10 steps, deterministic):")
         for i in range(10):
+            # Custom MaskedDQN handles the mask internally inside predict()
             action, _states = model.predict(obs, deterministic=True)
             obs, reward, done, _, info = env.step(action)
             

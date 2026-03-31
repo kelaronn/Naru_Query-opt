@@ -5,6 +5,7 @@ torchvision==0.24.0
 scipy==1.14.1
 gym
 stable_baselines3
+sb3-contrib
 tensorboard
 psycopg2-binary
 sqlalchemy
