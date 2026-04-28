@@ -8,3 +8,4 @@ extract_pdfs.py
 *.ckpt
 *.pdf
 *.txt
+*.csv

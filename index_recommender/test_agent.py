@@ -13,7 +13,7 @@ from stable_baselines3 import DQN
 
 # Import the environment and estimator from your existing file
 # Ensure index_env.py is in the same directory!
-from index_env import IndexEnv, NaruEstimator
+from index_env import IndexEnv, NaruEstimator, MaskedDQN
 
 def main():
     # --- 1. Setup Environment (Same as in training) ---
@@ -45,7 +45,7 @@ def main():
     
     # --- 2. Load the Trained Agent ---
     print("Loading Trained DQN Agent...")
-    agent_path = os.path.join(parent_dir, "index_advisor_dqn")
+    agent_path = os.path.join(parent_dir, "index_advisor_dqn_masked")
     
     if not os.path.exists(f"{agent_path}.zip"):
         print(f"Error: Trained agent file '{agent_path}.zip' not found.")
@@ -53,7 +53,7 @@ def main():
         return
 
     # Load the model from the zip file
-    model = DQN.load(agent_path)
+    model = MaskedDQN.load(agent_path, env=env)
 
     # --- 3. Testing (Inference Loop) ---
     print("\n=== STARTING INFERENCE TEST ===")
@@ -70,13 +70,15 @@ def main():
     print("-" * 100)
     
     # Run for a fixed number of steps (e.g., 10) or until 'done'
-    for i in range(10):
+    for i in range(50):
         # Predict the next action based on the observation
         # deterministic=True ensures the agent uses its best known strategy (no random exploration)
         action, _states = model.predict(obs, deterministic=True)
+        action = int(action)  # cast because predict() returns a numpy array
         
         # Execute the action in the environment
-        obs, reward, done, _, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
         
         # --- Logging Results ---
         # Decode action to column name and action type

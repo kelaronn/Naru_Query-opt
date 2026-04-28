@@ -13,7 +13,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import stable_baselines3
 from stable_baselines3 import DQN
-from stable_baselines3.common.callbacks import ProgressBarCallback
+from stable_baselines3.common.callbacks import ProgressBarCallback, BaseCallback
 from stable_baselines3.common.logger import configure
 import time
 
@@ -23,6 +23,29 @@ import estimators as estimators_lib
 from eval_model import MakeMade, GenerateQuery
 
 
+
+class EpsilonBumpCallback(BaseCallback):
+    """
+    Directly overrides model.exploration_rate every step during Phase 2.
+    This is necessary because SB3's internal scheduler computes progress_remaining < 0
+    when num_timesteps > _total_timesteps (Phase 2 only runs 1000 steps), immediately
+    resetting epsilon to 0.05 regardless of any manual setting.
+    """
+    def __init__(self, phase2_start_step: int, phase2_steps: int,
+                 bump_start: float = 0.3, bump_end: float = 0.05):
+        super().__init__()
+        self.phase2_start_step = phase2_start_step
+        self.phase2_steps = phase2_steps
+        self.bump_start = bump_start
+        self.bump_end = bump_end
+
+    def _on_step(self) -> bool:
+        elapsed = self.model.num_timesteps - self.phase2_start_step
+        progress = min(max(elapsed / self.phase2_steps, 0.0), 1.0)
+        self.model.exploration_rate = self.bump_end + (self.bump_start - self.bump_end) * (1.0 - progress)
+        return True
+
+
 # Configuration class replacing command-line arguments (argparse)
 class Config:
     def __init__(self):
@@ -30,7 +53,7 @@ class Config:
         self.db_url = 'postgresql://postgres:postgres@localhost:5432/naru_db'
         self.fc_hiddens = 128
         self.layers = 4
-        self.residual = True    #Must match training config, set to true for resmade
+        self.residual = False    #Must match training config, set to true for resmade
         self.direct_io = False
         self.input_encoding = 'binary'
         self.output_encoding = 'one_hot'
@@ -187,6 +210,43 @@ def estimate_cost_with_naru(naru_estimator, query, index_state):
         cost = float(total_rows * 1.5)
         
     return float(cost)
+    
+class MaskedDQN(DQN):
+        """
+        A custom DQN wrapper that enforces action masking during both:
+        1. Epsilon-greedy exploration (sample from valid actions only)
+        2. Q-value inference (argmax over valid actions only)
+        """
+        def predict(self, observation, state=None, episode_start=None, deterministic=False):
+            # 1. Get the action mask from the unwrapped environment
+            env = self.get_env().envs[0]
+            mask = env.unwrapped.action_masks()
+            
+            # 2. Get Q-values from the neural network
+            observation_tensor = torch.as_tensor(observation).reshape(1, -1).to(self.device)
+            with torch.no_grad():
+                q_values = self.q_net(observation_tensor).cpu().numpy()[0]
+            
+            # 3. Apply the mask: set Q-values of illegal actions to -infinity
+            q_values[~mask] = -np.inf
+            
+            # 4. Epsilon-greedy exploration (if not deterministic)
+            exploration = self.exploration_rate
+            
+            # EXPLORATION BUMP FOR PHASE 2:
+            # If we are in phase 2 and just started it, bump exploration to 30% manually
+            # to break out of the phase 1 local minimum.
+            if env.unwrapped.training_phase == 2 and self.num_timesteps < 4300:
+                exploration = max(exploration, 0.3)
+                
+            if not deterministic and np.random.rand() < exploration:
+                valid_actions = np.where(mask)[0]
+                action = np.random.choice(valid_actions)
+            else:
+                # Argmax over the masked Q-values (legal actions only)
+                action = np.argmax(q_values)
+                
+            return np.array([action]), None
 
 class IndexEnv(gym.Env):
     def __init__(self, naru_estimator):
@@ -226,6 +286,7 @@ class IndexEnv(gym.Env):
         self.baseline_cost_pg_time = 0.0
         self.baseline_cost_naru = 0.0
         self.penalty_per_index = 0.0
+        self.detailed_log_file = None
         
         # Compute the penalty scaling factor (alpha) once (database parameter)
         self.alpha = self._compute_alpha()
@@ -233,11 +294,18 @@ class IndexEnv(gym.Env):
         # Generate the initial workload and calculate baselines
         self._generate_dynamic_workload()
         
-        # State: 1 (tanulás NARU alapon), 2 (finomhangolás Postgres alapon)
+        # State: 1 (learning based on NARU), 2 (finetuning based on Postgres)
         self.training_phase = 1 
-
         self.current_step = 0
         self.max_steps_per_episode = 50
+
+    def set_log_path(self, log_path):
+        """Set the file path for logging."""
+        import os
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self.detailed_log_file = open(log_path, 'w')
+        # Header for CSV style
+        self.detailed_log_file.write("Phase,Step,State,Action,Reward\n")
 
     def step(self, action):
         terminated = False
@@ -246,12 +314,14 @@ class IndexEnv(gym.Env):
         # NOTE: illegal actions (create where index exists, drop where none exists)
         # are prevented at the algorithm level via action_masks(). This branch
         # acts as a silent safety-net only — it should never be reached during
-        # normal MaskablePPO training.
+        # normal MaskablePPO training, but DQN's epsilon-greedy hits it frequently.
+        state_changed = False
         if action == self.n_cols * 2:
             terminated = True
         elif action < self.n_cols:
             if self.state[action] == 0.0:   # safety: only act if truly valid
                 self.state[action] = 1.0
+                state_changed = True
                 col_name = self.naru.table.columns[action].name
                 index_name = f"idx_rl_{self.table_name}_{col_name.lower()}"
                 if self.training_phase == 2 and self.pg_conn:
@@ -264,6 +334,7 @@ class IndexEnv(gym.Env):
             target_col = action - self.n_cols
             if self.state[target_col] == 1.0:  # safety: only act if truly valid
                 self.state[target_col] = 0.0
+                state_changed = True
                 col_name = self.naru.table.columns[target_col].name
                 index_name = f"idx_rl_{self.table_name}_{col_name.lower()}"
                 if self.training_phase == 2 and self.pg_conn:
@@ -273,53 +344,91 @@ class IndexEnv(gym.Env):
                     except Exception as e:
                         print(f"Failed to drop index {index_name}: {e}")
 
-        # 3. Calculate Cost using PostgreSQL EXPLAIN over the Workload
-        total_value = 0.0
-
-        for current_query in self.workload:
-            try:
-                if self.training_phase == 1:
-                    raw_val = estimate_cost_with_naru(self.naru, current_query, self.state)
-                else:
-                    raw_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
-            except Exception as e:
-                raw_val = (self.baseline_cost_naru * 2.0) if self.training_phase == 1 else (self.baseline_cost_pg_time * 2.0)
-            total_value += float(raw_val)
-
-        avg_workload_val = total_value / self.workload_size
-
-        # Skálázási trükk: a Phase 2-es (ms) időket leképezzük a Phase 1-es (NARU) nagyságrendre!
-        # Így a PPO nem zavarodnak meg a fázisváltáskor.
-        if self.training_phase == 2:
-            time_ratio = avg_workload_val / self.baseline_cost_pg_time
-            scaled_cost = time_ratio * self.baseline_cost_naru
-            current_baseline_scaled = self.baseline_cost_naru
+        # 3. Calculate Cost (Skip if state hasn't changed to save time and avoid Jitter)
+        if not state_changed and not terminated and hasattr(self, 'previous_avg_workload_val'):
+            avg_workload_val = self.previous_avg_workload_val
+            reward = 0.0
         else:
-            scaled_cost = avg_workload_val
-            current_baseline_scaled = self.baseline_cost_naru
-
-        # 4. Compute Reward (Reward Shaping) - Improvement over baseline
-        improvement = current_baseline_scaled - scaled_cost
-
-        # Penalty: theoretically calibrated I/O overhead per B-Tree index (see _compute_penalty_per_index)
-        penalty = np.sum(self.state) * self.penalty_per_index
-
-        reward = float(improvement - penalty)
+            total_value = 0.0
+    
+            for current_query in self.workload:
+                try:
+                    if self.training_phase == 1:
+                        raw_val = estimate_cost_with_naru(self.naru, current_query, self.state)
+                    else:
+                        raw_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
+                except Exception as e:
+                    raw_val = (self.baseline_cost_naru * 2.0) if self.training_phase == 1 else (self.baseline_cost_pg_time * 2.0)
+                total_value += float(raw_val)
+    
+            avg_workload_val = total_value / self.workload_size
+            self.previous_avg_workload_val = avg_workload_val
+    
+            # Scaling trick: map Phase 2 (ms) times to Phase 1 (NARU) scale!
+            if self.training_phase == 2:
+                time_ratio = avg_workload_val / self.baseline_cost_pg_time
+                scaled_cost = time_ratio * self.baseline_cost_naru
+                current_baseline_scaled = self.baseline_cost_naru
+            else:
+                scaled_cost = avg_workload_val
+                current_baseline_scaled = self.baseline_cost_naru
+    
+            # 4. Compute Reward (Reward Shaping) - Improvement over baseline
+            
+        # W (Workload Frequency): Represents how many times the workload runs over the lifetime of the index.
+        # In real-world index tuning (like MS AutoAdmin), storage costs (penalty) are paid once, 
+        # while query execution savings are accumulated over thousands of runs.
+        # We assume the average query is run 100 times relative to the cost of storing the index.
+            W_LIFETIME = 100.0
+            
+            improvement = current_baseline_scaled - scaled_cost
+            total_lifetime_savings = improvement * W_LIFETIME
+    
+        # Penalty: theoretically calibrated I/O overhead per B-Tree index
+            penalty = np.sum(self.state) * self.penalty_per_index
+    
+        # The Absolute Evaluate Reward
+            current_total_reward = float(total_lifetime_savings - penalty)
+            
+        # FIX FOR EXPLOIT (Reward Farming): Use Differential Reward!
+        # The agent only gets points for IMPROVING the state, and loses points for making it worse.
+            if not hasattr(self, 'previous_total_reward'):
+                self.previous_total_reward = 0.0
+                
+            reward = current_total_reward - self.previous_total_reward
+            self.previous_total_reward = current_total_reward
 
         if terminated:
-            # Small bonus for choosing STOP cleanly
-            reward += float(current_baseline_scaled * 0.1)
+            pass  # No STOP bonus: differential reward already guides the agent.
+                  # A bonus here causes premature stopping for reward-farming.
+
+        # REWARD NORMALISATION: relative to maximum possible single-step improvement.
+        # ×2.0 → 10% improvement ≈ +0.2, 100% improvement ≈ +2.0
+        # Preserves gradient between "good" (+1.0) and "excellent" (+2.0) — no information loss from clipping.
+        W_LIFETIME = 100.0  # must match the value used above
+        reward = reward / (self.baseline_cost_naru * W_LIFETIME + 1e-9) * 2.0
+        # Safety clip ±3: catches any degenerate edge cases without clipping normal rewards.
+        reward = float(np.clip(reward, -10.0, 10.0))
 
         self.current_step += 1
-        truncated = self.current_step >= self.max_steps_per_episode
-        done = terminated or truncated
+        # Gymnasium standard: terminated = agent chose STOP, truncated = step budget exceeded.
+        # Keeping them separate preserves the Q-value bootstrap at episode boundary
+        # (a truncated state is NOT a terminal state, so gamma * V(s') is kept).
+        truncated = (self.current_step >= self.max_steps_per_episode) and not terminated
 
         info = {
             "query_cost": float(avg_workload_val),
             "num_indexes": float(np.sum(self.state))
         }
 
-        return self.state, reward, done, False, info
+        # Writing to the open log file without terminal spam
+        if hasattr(self, 'detailed_log_file') and self.detailed_log_file and not self.detailed_log_file.closed:
+            state_str = "[" + " ".join(f"{x:.1f}" for x in self.state) + "]"
+            log_msg = f"{self.training_phase},{self.current_step},{state_str},{action},{reward:.4f}\n"
+            self.detailed_log_file.write(log_msg)
+            self.detailed_log_file.flush() # Ensures that it is written to the disk immediately
+
+        return self.state, reward, terminated, truncated, info
 
     def _generate_dynamic_workload(self):
         """
@@ -445,6 +554,9 @@ class IndexEnv(gym.Env):
 
         self.state = np.zeros(self.n_cols, dtype=np.float32)
         self.current_step = 0
+        self.previous_total_reward = 0.0
+        if hasattr(self, 'previous_avg_workload_val'):
+            del self.previous_avg_workload_val
         
         # Dynamically sample a fresh 10 queries and compute their un-indexed baselines
         self._generate_dynamic_workload()
@@ -452,6 +564,8 @@ class IndexEnv(gym.Env):
         return self.state, {}
     
     def close(self):
+        if hasattr(self, 'detailed_log_file') and self.detailed_log_file and not self.detailed_log_file.closed:
+            self.detailed_log_file.close()
         if hasattr(self, 'pg_conn') and self.pg_conn:
             self.pg_conn.close()
         super().close()
@@ -460,34 +574,7 @@ if __name__ == "__main__":
     from stable_baselines3.common.callbacks import ProgressBarCallback
     
     # --- Custom DQN Action Masking ---
-    class MaskedDQN(DQN):
-        """
-        A custom DQN wrapper that enforces action masking during both:
-        1. Epsilon-greedy exploration (sample from valid actions only)
-        2. Q-value inference (argmax over valid actions only)
-        """
-        def predict(self, observation, state=None, episode_start=None, deterministic=False):
-            # 1. Get the action mask from the unwrapped environment
-            env = self.get_env().envs[0]
-            mask = env.unwrapped.action_masks()
-            
-            # 2. Get Q-values from the neural network
-            observation_tensor = torch.as_tensor(observation).reshape(1, -1).to(self.device)
-            with torch.no_grad():
-                q_values = self.q_net(observation_tensor).cpu().numpy()[0]
-            
-            # 3. Apply the mask: set Q-values of illegal actions to -infinity
-            q_values[~mask] = -np.inf
-            
-            # 4. Epsilon-greedy exploration (if not deterministic)
-            if not deterministic and np.random.rand() < self.exploration_rate:
-                valid_actions = np.where(mask)[0]
-                action = np.random.choice(valid_actions)
-            else:
-                # Argmax over the masked Q-values (legal actions only)
-                action = np.argmax(q_values)
-                
-            return np.array([action]), None
+    
     from stable_baselines3.common.callbacks import ProgressBarCallback
     
     parent_dir_main = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -513,6 +600,13 @@ if __name__ == "__main__":
         env = IndexEnv(naru)
         torch.set_grad_enabled(True)
 
+        # Creating folders for logs (common folder for phases)
+        run_name = f"DQN_Masked_Run_{int(time.time())}"
+        log_dir = f"./tensorboard_logs/{run_name}"
+        os.makedirs(log_dir, exist_ok=True)
+        # Setting the detailed per-step logging for the env!
+        env.set_log_path(os.path.join(log_dir, "log_perstep.txt"))
+
         print("\n--- PHASE 1: Training based on NARU estimated costs ---")
         env.training_phase = 1
 
@@ -526,30 +620,59 @@ if __name__ == "__main__":
             learning_starts=1000,
             batch_size=64,
             gamma=0.99,
-            exploration_fraction=0.3
+            exploration_fraction=0.3,
+            max_grad_norm=10,          # Gradient clipping: prevents exploding gradients
         )
         
-        # Leghatékonyabb megoldás: Egyedi logger, ami egyetlen timestamp mappába gyűjti mindkét fázist
-        # A 'log' a txt/log szöveges mentést, a 'csv' a táblázatos mentést készíti a folyamatsávról
-        run_name = f"DQN_Masked_Run_{int(time.time())}"
-        log_dir = f"./tensorboard_logs/{run_name}"
+        # Most efficient solution: Custom logger that collects both phases in a single timestamp folder
+        # 'log' saves the text/log, 'csv' saves the tabular data of the process
         custom_logger = configure(log_dir, ["stdout", "tensorboard", "log", "csv"])
         model.set_logger(custom_logger)
         
-        print(f"Tensorboard naplózás helye: {log_dir}")
+        print(f"Tensorboard logging location: {log_dir}")
         print("Training for 4,000 timesteps directly from Naru estimator...")
         model.learn(total_timesteps=4000, callback=ProgressBarCallback())
         
-        print("\n--- PHASE 2: Finomhangolás PostgreSQL EXPLAIN értékekkel ---")
+        print("\n--- PHASE 2: Finetuning using PostgreSQL EXPLAIN values ---")
         env.training_phase = 2
-        # Töröljük a fizikai indexeket a biztonság kedvéért fázisváltáskor
+        # Reset replay buffer: Phase 1 Naru Q-values mislead the agent in Phase 2 —
+        # as epsilon decreases, the agent exploits wrong Phase 1 intuitions ("create all indexes")
+        # which Postgres actually penalises. A clean buffer forces Postgres-only learning.
+        if hasattr(model, 'replay_buffer') and model.replay_buffer is not None:
+            model.replay_buffer.reset()
+        # Delete physical indexes for safety during phase transition
         env.reset()
         
-        print("Training for 1,000 timesteps using Postgres Database...")
-        # Reset_num_timesteps=False, hogy lássuk a görbén a folytatást (tb log)
-        model.learn(total_timesteps=1000, callback=ProgressBarCallback(), reset_num_timesteps=False)
+        # CRITICAL FIX: SB3 DQN's internal _on_step() runs AFTER our callback every step and
+        # calls: self.exploration_rate = self.exploration_schedule(progress_remaining)
+        # This ALWAYS overrides our callback's value back to 0.05!
+        # Solution: Replace exploration_schedule with an identity lambda that just returns the
+        # current exploration_rate unchanged → _on_step becomes a no-op for epsilon,
+        # and EpsilonBumpCallback has FULL control over exploration_rate.
+        model.exploration_schedule = lambda _: model.exploration_rate
+        
+        print("Training for 2,000 timesteps using Postgres Database...")
+        phase1_steps = 4000
+        phase2_steps = 2000
+        epsilon_callback = EpsilonBumpCallback(
+            phase2_start_step=phase1_steps,
+            phase2_steps=phase2_steps,
+            bump_start=0.3,
+            bump_end=0.05
+        )
+        # reset_num_timesteps=False → TensorBoard remains linear AND learning_starts stays satisfied
+        model.learn(
+            total_timesteps=phase2_steps,
+            callback=[ProgressBarCallback(), epsilon_callback],
+            reset_num_timesteps=False
+        )
 
         print("Training finished.")
+        # Restore a picklable exploration_schedule before saving.
+        # Our lambda captures 'model' (which holds env with psycopg2 connection → not picklable).
+        # Replacing it with a simple constant function resolves the TypeError on model.save().
+        final_eps = model.exploration_rate
+        model.exploration_schedule = lambda _: final_eps
         model.save("index_advisor_dqn_masked")
         print("Agent saved to 'index_advisor_dqn_masked.zip'")
         
@@ -558,7 +681,9 @@ if __name__ == "__main__":
         for i in range(10):
             # Custom MaskedDQN handles the mask internally inside predict()
             action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, _, info = env.step(action)
+            action = int(action)  # predict() returns numpy array; columns[] needs a scalar
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             
             if action == env.n_cols * 2:
                 action_type = "STOP"

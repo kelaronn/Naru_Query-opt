@@ -70,12 +70,12 @@ def generate_tpch_lineitem(num_rows):
 if __name__ == "__main__":
     print(">>> SCRIPT STARTED...")
     
-    # Generate 10,000 rows
-    ROW_COUNT = 10000
+    # Generate 1,000,000 rows (~1GB)
+    ROW_COUNT = 1000000
     df_tpch = generate_tpch_lineitem(ROW_COUNT)
     
     # Save to CSV
-    filename = "tpch_lineitem_10k.csv"
+    filename = "datasets/tpch_lineitem_1m.csv"
     df_tpch.to_csv(filename, index=False)
     
     print(f"Done! File saved: {filename}")

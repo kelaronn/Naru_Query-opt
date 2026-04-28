@@ -34,7 +34,8 @@ def setup_db(csv_path, db_url):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Load CSV data into PostgreSQL')
-    parser.add_argument('--csv', type=str, default='datasets/tpch_lineitem_10k.csv', help='Path to CSV file')
+    # Change the default values if needed
+    parser.add_argument('--csv', type=str, default='datasets/tpch_lineitem_1m.csv', help='Path to CSV file')
     parser.add_argument('--db-url', type=str, default='postgresql://postgres:postgres@localhost:5432/naru_db', help='PostgreSQL connection string')
     
     args = parser.parse_args()

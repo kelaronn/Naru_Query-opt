@@ -199,13 +199,15 @@ def InvertOrder(order):
 def MakeTable():
     # To extend to other datasets, modify here.
     # Add dataset loading in datasets.py as well.
-    assert args.dataset in ['dmv-tiny', 'dmv', 'tpch']
+    assert args.dataset in ['dmv-tiny', 'dmv', 'tpch', 'tpch_pg']
     if args.dataset == 'dmv-tiny':
         table = datasets.LoadDmv('dmv-tiny.csv')
     elif args.dataset == 'dmv':
         table = datasets.LoadDmv()
     elif args.dataset == 'tpch':
-        table = datasets.LoadTpch('tpch_lineitem_10k.csv')
+        table = datasets.LoadTpch('tpch_lineitem_1m.csv')
+    elif args.dataset == 'tpch_pg':
+        table = datasets.LoadTpchFromPostgres()
 
     oracle_est = estimators_lib.Oracle(table)
     if args.run_bn:
@@ -235,8 +237,8 @@ def SampleTupleThenRandom(all_cols,
         # Giant hack for DMV.
         vals[6] = vals[6].to_datetime64()
 
-    elif args.dataset == 'tpch':
-        # Indices 10, 11, 12 correspond to L_SHIPDATE, L_COMMITDATE, L_RECEIPTDATE
+    elif 'tpch' in args.dataset:
+        # Indices correspond to L_SHIPDATE, L_COMMITDATE, L_RECEIPTDATE
         # in the LoadTpch column definition. We must convert them to datetime64
         # for correct comparison operations (<=, >=).
         target_date_cols = ['L_SHIPDATE', 'L_COMMITDATE', 'L_RECEIPTDATE']
@@ -592,7 +594,7 @@ def Main():
                                     seed=seed)
         else:
             # Add further datasets here as needed.
-            if args.dataset in ['dmv-tiny', 'dmv', 'tpch']:
+            if args.dataset in ['dmv-tiny', 'dmv', 'tpch', 'tpch_pg']:
                 model = MakeMade(
                     scale=args.fc_hiddens,
                     cols_to_train=table.columns,

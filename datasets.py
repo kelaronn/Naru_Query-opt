@@ -19,7 +19,7 @@ def LoadDmv(filename='Vehicle__Snowmobile__and_Boat_Registrations.csv'):
     type_casts = {'Reg Valid Date': np.datetime64}
     return common.CsvTable('DMV', csv_file, cols, type_casts)
 
-def LoadTpch(filename='tpch_lineitem_10k.csv'):
+def LoadTpch(filename='tpch_lineitem_1m.csv'):
     # Path to the file. If you didn't save it in the 'datasets' folder,
     # change it to './{}'.format(filename) or move the csv to 'datasets'.
     csv_file = './datasets/{}'.format(filename)
