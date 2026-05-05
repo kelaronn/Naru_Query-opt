@@ -9,3 +9,4 @@ extract_pdfs.py
 *.pdf
 *.txt
 *.csv
+*.zip

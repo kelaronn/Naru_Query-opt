@@ -110,12 +110,13 @@ class NaruEstimator:
 def calculate_cost(naru, query, pg_conn=None, analyze=False, table_name='lineitem'):
     """
     Calculates the execution cost of a query using PostgreSQL's EXPLAIN.
-    If analyze is True, executes the query and returns Actual Execution Time (ms).
+    If analyze is True, executes the query and returns Actual Execution Time (ms) and Shared Read Blocks.
     Otherwise returns Planner Total Cost.
     """
     cols, ops, vals = query
     
     if pg_conn is None:
+        if analyze: return 10000.0, 0.0
         return 10000.0 # Fallback
         
     where_clauses = []
@@ -133,19 +134,31 @@ def calculate_cost(naru, query, pg_conn=None, analyze=False, table_name='lineite
     where_str = " AND ".join(where_clauses)
     
     if analyze:
-        sql_query = f"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM {table_name} WHERE {where_str};"
+        sql_query = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM {table_name} WHERE {where_str};"
     else:
         sql_query = f"EXPLAIN (FORMAT JSON) SELECT * FROM {table_name} WHERE {where_str};"
     
     try:
         with pg_conn.cursor() as cur:
-            cur.execute(sql_query)
-            result = cur.fetchone()
             if analyze:
-                # Actual time taken for the query in ms
-                execution_time = result[0][0].get('Execution Time', 10000.0)
-                return float(execution_time)
+                execution_times = []
+                shared_blks_read_list = []
+                # Execute 3 times to get a stable median (filtering out cache noise)
+                for _ in range(3):
+                    cur.execute(sql_query)
+                    result = cur.fetchone()
+                    plan = result[0][0]['Plan']
+                    exec_time = result[0][0].get('Execution Time', 10000.0)
+                    shared_blks_read = plan.get('Shared Read Blocks', 0)
+                    execution_times.append(exec_time)
+                    shared_blks_read_list.append(shared_blks_read)
+                
+                median_time = float(np.median(execution_times))
+                median_blks = float(np.median(shared_blks_read_list))
+                return median_time, median_blks
             else:
+                cur.execute(sql_query)
+                result = cur.fetchone()
                 plan = result[0][0]['Plan']
                 total_cost = plan['Total Cost']
                 return float(total_cost)
@@ -156,6 +169,7 @@ def calculate_cost(naru, query, pg_conn=None, analyze=False, table_name='lineite
             pg_conn.rollback()
         except:
             pass
+        if analyze: return 10000.0, 0.0
         return 10000.0
 
 def generate_workload_query(table, rng, dataset_name='tpch'):
@@ -249,7 +263,7 @@ class MaskedDQN(DQN):
             return np.array([action]), None
 
 class IndexEnv(gym.Env):
-    def __init__(self, naru_estimator):
+    def __init__(self, naru_estimator, dynamic_workload=False):
         super(IndexEnv, self).__init__()
         self.naru = naru_estimator
         self.dataset_name = self.naru.cfg.dataset
@@ -257,9 +271,14 @@ class IndexEnv(gym.Env):
         # Table name used in all SQL statements — change here if you switch datasets.
         self.table_name = 'lineitem'
         
+        self.dynamic_workload = dynamic_workload
+        
         self.action_space = gym.spaces.Discrete(self.n_cols * 2 + 1)
-        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.n_cols,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.n_cols * 2,), dtype=np.float32)
         self.state = np.zeros(self.n_cols, dtype=np.float32)
+        self.workload_features = np.zeros(self.n_cols, dtype=np.float32)
+        
+        self.cost_cache = {} # Cache a már kiértékelt index konfigurációkhoz
         
         self.rng = np.random.RandomState(42)  # Seeded for determinism
         
@@ -345,23 +364,45 @@ class IndexEnv(gym.Env):
                         print(f"Failed to drop index {index_name}: {e}")
 
         # 3. Calculate Cost (Skip if state hasn't changed to save time and avoid Jitter)
+        state_tuple = tuple(self.state)
+        
         if not state_changed and not terminated and hasattr(self, 'previous_avg_workload_val'):
             avg_workload_val = self.previous_avg_workload_val
             reward = 0.0
         else:
-            total_value = 0.0
-    
-            for current_query in self.workload:
-                try:
-                    if self.training_phase == 1:
-                        raw_val = estimate_cost_with_naru(self.naru, current_query, self.state)
-                    else:
-                        raw_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
-                except Exception as e:
-                    raw_val = (self.baseline_cost_naru * 2.0) if self.training_phase == 1 else (self.baseline_cost_pg_time * 2.0)
-                total_value += float(raw_val)
-    
-            avg_workload_val = total_value / self.workload_size
+            if state_tuple in self.cost_cache:
+                cached_vals = self.cost_cache[state_tuple]
+                if isinstance(cached_vals, tuple):
+                    avg_workload_val, total_regression_penalty = cached_vals
+                else:
+                    avg_workload_val = cached_vals
+                    total_regression_penalty = 0.0
+            else:
+                total_value = 0.0
+                total_regression_penalty = 0.0
+        
+                for i, current_query in enumerate(self.workload):
+                    try:
+                        if self.training_phase == 1:
+                            raw_val = estimate_cost_with_naru(self.naru, current_query, self.state)
+                        else:
+                            time_val, blks_val = calculate_cost(self.naru, current_query, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
+                            # Hibrid reward: domináns a futási idő, kiegészítve az olvasott blokkok számával (w1=1.0, w2=0.1)
+                            raw_val = time_val + (blks_val * 0.1)
+                            
+                            # Regression check (Phase 2 only)
+                            if hasattr(self, 'baseline_individual_pg') and i < len(self.baseline_individual_pg):
+                                if raw_val > self.baseline_individual_pg[i] * 1.05:
+                                    slowdown = float(raw_val - self.baseline_individual_pg[i])
+                                    total_regression_penalty += slowdown * 2.0
+                                    
+                    except Exception as e:
+                        raw_val = (self.baseline_cost_naru * 2.0) if self.training_phase == 1 else (self.baseline_cost_pg_time * 2.0)
+                    total_value += float(raw_val)
+        
+                avg_workload_val = total_value / self.workload_size
+                self.cost_cache[state_tuple] = (avg_workload_val, total_regression_penalty)
+                
             self.previous_avg_workload_val = avg_workload_val
     
             # Scaling trick: map Phase 2 (ms) times to Phase 1 (NARU) scale!
@@ -369,29 +410,39 @@ class IndexEnv(gym.Env):
                 time_ratio = avg_workload_val / self.baseline_cost_pg_time
                 scaled_cost = time_ratio * self.baseline_cost_naru
                 current_baseline_scaled = self.baseline_cost_naru
+                
+                # Scale regression penalty to Phase 1 units
+                scaled_regression_penalty = (total_regression_penalty / self.baseline_cost_pg_time) * self.baseline_cost_naru
             else:
                 scaled_cost = avg_workload_val
                 current_baseline_scaled = self.baseline_cost_naru
+                scaled_regression_penalty = total_regression_penalty
     
             # 4. Compute Reward (Reward Shaping) - Improvement over baseline
-            
-        # W (Workload Frequency): Represents how many times the workload runs over the lifetime of the index.
-        # In real-world index tuning (like MS AutoAdmin), storage costs (penalty) are paid once, 
-        # while query execution savings are accumulated over thousands of runs.
-        # We assume the average query is run 100 times relative to the cost of storing the index.
             W_LIFETIME = 100.0
             
             improvement = current_baseline_scaled - scaled_cost
             total_lifetime_savings = improvement * W_LIFETIME
     
-        # Penalty: theoretically calibrated I/O overhead per B-Tree index
-            penalty = np.sum(self.state) * self.penalty_per_index
-    
-        # The Absolute Evaluate Reward
-            current_total_reward = float(total_lifetime_savings - penalty)
+            # Progressive (Exponential) Penalty logic
+            num_indexes = int(np.sum(self.state))
+            weights = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
             
-        # FIX FOR EXPLOIT (Reward Farming): Use Differential Reward!
-        # The agent only gets points for IMPROVING the state, and loses points for making it worse.
+            progressive_penalty_multiplier = 0.0
+            for i in range(num_indexes):
+                if i < len(weights):
+                    progressive_penalty_multiplier += weights[i]
+                else:
+                    progressive_penalty_multiplier += weights[-1] * (2 ** (i - len(weights) + 1))
+                    
+            penalty = progressive_penalty_multiplier * self.penalty_per_index
+            scaled_regression_penalty_lifetime = scaled_regression_penalty * W_LIFETIME
+    
+            # The Absolute Evaluate Reward
+            current_total_reward = float(total_lifetime_savings - penalty - scaled_regression_penalty_lifetime)
+            
+            # FIX FOR EXPLOIT (Reward Farming): Use Differential Reward!
+            # The agent only gets points for IMPROVING the state, and loses points for making it worse.
             if not hasattr(self, 'previous_total_reward'):
                 self.previous_total_reward = 0.0
                 
@@ -428,7 +479,9 @@ class IndexEnv(gym.Env):
             self.detailed_log_file.write(log_msg)
             self.detailed_log_file.flush() # Ensures that it is written to the disk immediately
 
-        return self.state, reward, terminated, truncated, info
+        # Kombinált observation visszaadása
+        obs = np.concatenate([self.state, self.workload_features])
+        return obs, reward, terminated, truncated, info
 
     def _generate_dynamic_workload(self):
         """
@@ -437,15 +490,30 @@ class IndexEnv(gym.Env):
         Called in __init__ and at the start of every episode in reset().
         """
         self.workload = []
+        col_counts = np.zeros(self.n_cols, dtype=np.float32)
         for _ in range(self.workload_size):
-            self.workload.append(generate_workload_query(self.naru.table, self.rng, self.dataset_name))
+            q_cols, q_ops, q_vals = generate_workload_query(self.naru.table, self.rng, self.dataset_name)
+            self.workload.append((q_cols, q_ops, q_vals))
+            
+            for col in q_cols:
+                col_idx = self.naru.table.columns.index(col)
+                col_counts[col_idx] += 1.0
+                
+        # Normalizáljuk az előfordulásokat
+        if np.max(col_counts) > 0:
+            self.workload_features = col_counts / np.max(col_counts)
+        else:
+            self.workload_features = col_counts
             
         self.baseline_cost_pg_time = 0.0
         self.baseline_cost_naru = 0.0
+        self.baseline_individual_pg = []
         empty_index_state = np.zeros(self.n_cols, dtype=np.float32)
         
         for q in self.workload:
-            c_pg = calculate_cost(self.naru, q, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
+            time_val, blks_val = calculate_cost(self.naru, q, pg_conn=self.pg_conn, analyze=True, table_name=self.table_name)
+            c_pg = time_val + (blks_val * 0.1)
+            self.baseline_individual_pg.append(float(c_pg))
             self.baseline_cost_pg_time += float(c_pg)
             c_naru = estimate_cost_with_naru(self.naru, q, empty_index_state)
             self.baseline_cost_naru += float(c_naru)
@@ -535,11 +603,12 @@ class IndexEnv(gym.Env):
         [2*n_cols]          STOP                       — always valid
         """
         mask = np.zeros(self.n_cols * 2 + 1, dtype=bool)
+        num_active_indexes = np.sum(self.state)
         for i in range(self.n_cols):
-            if self.state[i] == 0.0:
-                mask[i] = True               # CREATE valid: slot is empty
+            if self.state[i] == 0.0 and num_active_indexes < 3:
+                mask[i] = True               # CREATE valid: slot is empty and limit not reached (now 6)
             else:
-                mask[self.n_cols + i] = True  # DROP  valid: slot is occupied
+                mask[self.n_cols + i] = False # DROP forbiddden to avoid oscillation
         mask[self.n_cols * 2] = True          # STOP is always a legal choice
         return mask
 
@@ -558,10 +627,13 @@ class IndexEnv(gym.Env):
         if hasattr(self, 'previous_avg_workload_val'):
             del self.previous_avg_workload_val
         
-        # Dynamically sample a fresh 10 queries and compute their un-indexed baselines
-        self._generate_dynamic_workload()
+        # Ha dinamikus, minden epizódban új workload lesz. Ha statikus (History), akkor marad az eddigi!
+        if self.dynamic_workload or not self.workload:
+            self._generate_dynamic_workload()
+            self.cost_cache.clear() # Új workload esetén töröljük a cache-t
 
-        return self.state, {}
+        obs = np.concatenate([self.state, self.workload_features])
+        return obs, {}
     
     def close(self):
         if hasattr(self, 'detailed_log_file') and self.detailed_log_file and not self.detailed_log_file.closed:
@@ -571,8 +643,46 @@ class IndexEnv(gym.Env):
         super().close()
 
 if __name__ == "__main__":
-    from stable_baselines3.common.callbacks import ProgressBarCallback
+    from stable_baselines3.common.callbacks import ProgressBarCallback, BaseCallback
     
+    class EarlyStopCallback(BaseCallback):
+        def __init__(self, patience_steps=1000, verbose=0):
+            super(EarlyStopCallback, self).__init__(verbose)
+            self.best_reward = -float('inf')
+            self.episode_reward = 0.0
+            self.patience_steps = patience_steps
+            self.steps_since_best = 0
+            
+        def _on_step(self) -> bool:
+            reward = self.locals['rewards'][0]
+            self.episode_reward += reward
+            done = self.locals['dones'][0]
+            
+            self.steps_since_best += 1
+            
+            if done:
+                if self.episode_reward > self.best_reward:
+                    self.best_reward = self.episode_reward
+                    self.steps_since_best = 0  # Reset patience!
+                    print(f" [EarlyStop] Új legjobb Epizód Reward: {self.best_reward:.4f}! Modell mentése...")
+                    
+                    # Temporarily replace exploration_schedule to make the model picklable
+                    original_schedule = self.model.exploration_schedule
+                    current_eps = float(self.model.exploration_rate)
+                    self.model.exploration_schedule = lambda _: current_eps
+                    
+                    self.model.save("index_advisor_dqn_masked_best")
+                    
+                    # Restore original schedule so EpsilonBumpCallback can still work
+                    self.model.exploration_schedule = original_schedule
+                    
+                self.episode_reward = 0.0
+                
+            if self.steps_since_best >= self.patience_steps:
+                print(f" [EarlyStop] Nincs javulás {self.patience_steps} lépés óta! Tréning leállítása (Early Stopping).")
+                return False  # False visszatérési érték megállítja a tréninget!
+            return True
+            
     # --- Custom DQN Action Masking ---
     
     from stable_baselines3.common.callbacks import ProgressBarCallback
@@ -597,7 +707,8 @@ if __name__ == "__main__":
     
     try:
         naru = NaruEstimator(model_path=MODEL_PATH, device=device)
-        env = IndexEnv(naru)
+        # Dinamikus workload bekapcsolva: minden epizódban új lekérdezéseket generál, hogy megtanuljon általánosítani
+        env = IndexEnv(naru, dynamic_workload=False)
         torch.set_grad_enabled(True)
 
         # Creating folders for logs (common folder for phases)
@@ -651,19 +762,23 @@ if __name__ == "__main__":
         # and EpsilonBumpCallback has FULL control over exploration_rate.
         model.exploration_schedule = lambda _: model.exploration_rate
         
-        print("Training for 2,000 timesteps using Postgres Database...")
-        phase1_steps = 4000
-        phase2_steps = 2000
+        print("Training Phase 2 using Postgres Database (Early Stopping enabled)...")
+        phase2_max_steps = 10000  # Nagyon magasra állítjuk, hogy az Early Stopping állítsa meg!
+        
+        early_stop_callback = EarlyStopCallback(patience_steps=1500)
+        
+        # Visszahozzuk az EpsilonBump-ot egy kisebb értékkel, hogy legyen esélye "elfelejteni" a rossz Phase 1 szokásokat!
         epsilon_callback = EpsilonBumpCallback(
-            phase2_start_step=phase1_steps,
-            phase2_steps=phase2_steps,
-            bump_start=0.3,
+            phase2_start_step=4000,
+            phase2_steps=phase2_max_steps,
+            bump_start=0.2,
             bump_end=0.05
         )
+        
         # reset_num_timesteps=False → TensorBoard remains linear AND learning_starts stays satisfied
         model.learn(
-            total_timesteps=phase2_steps,
-            callback=[ProgressBarCallback(), epsilon_callback],
+            total_timesteps=phase2_max_steps,
+            callback=[ProgressBarCallback(), epsilon_callback, early_stop_callback],
             reset_num_timesteps=False
         )
 
@@ -671,10 +786,16 @@ if __name__ == "__main__":
         # Restore a picklable exploration_schedule before saving.
         # Our lambda captures 'model' (which holds env with psycopg2 connection → not picklable).
         # Replacing it with a simple constant function resolves the TypeError on model.save().
-        final_eps = model.exploration_rate
-        model.exploration_schedule = lambda _: final_eps
-        model.save("index_advisor_dqn_masked")
-        print("Agent saved to 'index_advisor_dqn_masked.zip'")
+        model.exploration_schedule = lambda _: 0.05
+        model.save("index_advisor_dqn_masked_final")
+        print("Final model saved to 'index_advisor_dqn_masked_final.zip'")
+        
+        # A legjobb modellt töltjük vissza a teszthez
+        print("\nLoading the BEST model found during Phase 2 for testing...")
+        if os.path.exists("index_advisor_dqn_masked_best.zip"):
+            model = MaskedDQN.load("index_advisor_dqn_masked_best", env=env)
+        else:
+            print("No best model found, using final model.")
         
         obs, _ = env.reset()
         print("\nTesting trained agent (10 steps, deterministic):")
